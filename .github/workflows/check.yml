@@ -1,0 +1,22 @@
+# Runs the tests, then runs the Action on this repository exactly as a user would, with the workflow's own read-only token.
+name: Agent Authority Check
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests -v
+  this-repository:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: charles-337/agent-authority-check@v1
