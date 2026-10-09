@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-authority-check"
+version = "1.0.0"
+description = "Read-only: what stands between an AI coding agent and your repository's main branch, and can the agent's credential switch it off?"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+agent-authority-check = "change_passport.authority:main"
+
+[project.urls]
+Issues = "https://github.com/charles-337/agent-authority-check/issues"
+
+[tool.setuptools]
+packages = ["change_passport"]

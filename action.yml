@@ -1,0 +1,36 @@
+name: Haven Agent Authority Check
+description: "Read-only. Shows what stands between an AI coding agent and this repository's main branch, and what a credential may do to those protections."
+branding:
+  icon: shield
+  color: gray-dark
+inputs:
+  token:
+    description: "The credential to assess. Defaults to this workflow's own token. To assess your coding agent, pass the agent's token from a secret (read access is enough)."
+    default: ${{ github.token }}
+  repository:
+    description: "OWNER/NAME to check"
+    default: ${{ github.repository }}
+  branch:
+    description: "The branch to check (default: the repository's default branch)"
+    default: ""
+  fail-on-high:
+    description: "Fail the job when a HIGH finding exists"
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        PYTHONPATH: ${{ github.action_path }}
+        REPO: ${{ inputs.repository }}
+        BRANCH: ${{ inputs.branch }}
+        FAIL: ${{ inputs.fail-on-high }}
+      run: |
+        args=(--repo "$REPO" --out "$RUNNER_TEMP/agent-authority-report" --summary)
+        [ -n "$BRANCH" ] && args+=(--branch "$BRANCH")
+        [ "$FAIL" = "true" ] && args+=(--fail-on-high)
+        python -m change_passport.authority "${args[@]}"
