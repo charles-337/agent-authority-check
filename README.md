@@ -33,6 +33,8 @@ You'll get one headline finding, for example:
 > *Check it yourself:* `curl -si -H "Authorization: Bearer $GITHUB_TOKEN" "https://api.github.com/repos/OWNER/NAME" | grep -i -E 'x-oauth-scopes|"admin"'`
 > *Fix:* give the agent its own identity (a machine account or a GitHub App) with write access only.
 
+When the fix is a setting, the report also prints the exact command that applies it (see [Fixing what it finds](#fixing-what-it-finds)).
+
 The full example is in [`examples/agent-authority-report/report.md`](examples/agent-authority-report/report.md). It comes from a real run with the names hidden.
 
 The check comes from Haven's Change Passport, which enforces exact-change approvals for AI agents. It is licensed under Apache-2.0.
@@ -77,17 +79,31 @@ Every report also lists **what protects the branch**, as far as this credential 
     fail-on-high: "false"
 ```
 
-The report appears in the run's summary. The check itself uses only Python's standard library, so the Action installs nothing; the pip package also brings PyYAML, which the Change Passport's other commands use.
+The report appears in the run's summary. The check uses only Python's standard library, so neither the Action nor the pip package installs anything else.
 
-## Next step
+## Fixing what it finds
 
-This check reads configuration. If you want proof that your controls actually stop an agent, Haven can run an isolated live test against a copy of your setup. It covers:
-- what the agent may do on its own;
-- what needs an exact signed approval;
-- what is refused;
-- whether its own credential can switch the controls off.
+- **Nothing stops a direct push, or nothing requires a pull request:** the report prints one `gh api` command that adds the missing ruleset: a pull request with one approval, from a code owner where a CODEOWNERS file names one, and no force-push or deletion. You run it as a repository admin; the check itself never writes. If you work alone, nobody else can approve your pull requests, so the report prints a second command to use instead. It lets repository admins merge a pull request without another approval, and nothing more: no one may push directly, and anyone without admin rights, an agent included, still needs someone else's approval.
+- **The credential can switch protection off:** no command can fix this for you. Give the agent its own identity with write access only, either a machine account or a GitHub App, and give the agent only that identity's token. Then run the check again with that token.
+- After each fix, run the check again. The finding you fixed should be gone.
 
-You get evidence you can verify yourself.
+## Beyond branch settings
+
+Branch rules decide what may land on a branch. They treat every pull request the same, whoever wrote it, and they see nothing an agent does before it pushes. Haven's guard is for teams that want to give a coding agent more room without losing control of what matters:
+
+- **One authority rule per agent:** what it may merge itself, what needs a person's signed approval of that exact change, and what it may never touch.
+- **A check inside the agent's session:** a Claude Code hook stops a protected action before it runs, including edits to the agent's own rules or keys.
+- **A receipt for every decision:** hash-chained, so an edited receipt is caught.
+
+**What has been shown, in a sandbox with a live Claude Code agent:**
+- the agent's routine change was allowed and reached main with no review;
+- its push of a production change was stopped before it ran, because no one had signed an approval of that exact change;
+- the same commit, pushed separately with the hook out of the way, was refused by the protected repository's own check;
+- its attempt to edit the guard's settings was refused.
+
+**Not yet shown:** enforcement on GitHub itself. The guard is a boundary only where the agent's own credential can't switch the branch rules off, which is why the fixes above come first.
+
+The guard isn't published. Haven sets it up for one agent workflow against a copy of your setup, then reports what it allowed, held and refused, with evidence you can check yourself.
 
 - Questions, problems or ideas: open an issue at https://github.com/charles-337/agent-authority-check/issues.
-- The live test: charles_337@me.com
+- The guard: charles_337@me.com

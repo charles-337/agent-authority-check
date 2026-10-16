@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-authority-check"
-version = "1.0.0"
+version = "1.1.0"
 description = "Read-only: what stands between an AI coding agent and your repository's main branch, and can the agent's credential switch it off?"
 readme = "README.md"
 license = {text = "Apache-2.0"}

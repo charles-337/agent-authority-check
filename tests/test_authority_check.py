@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import os
+import shlex
 import sys
 import tempfile
 import unittest
@@ -84,6 +85,7 @@ class Findings(unittest.TestCase):
                             f"/repos/{REPO}/contents/.github/CODEOWNERS?ref=main": codeowners("* @lead\n/.github/ @lead @sec\n")}, extra=["--fail-on-high"])
         self.assertEqual(code, 0)
         self.assertEqual([f["severity"] for f in rep["findings"]], ["OK"])
+        self.assertIn("Rulesets: require a pull request (1 approval, code-owner review); block force-pushes", rep["protects"])
         self.assertEqual(rep["verdict"], "`main` is protected, but its settings are visible only to repository admins. No gap found in what is visible.")
         self.assertTrue(any("only repository admins can read them" in u for u in rep["cannot_determine"]))
 
@@ -118,6 +120,91 @@ class Findings(unittest.TestCase):
     def test_fail_on_high_for_ci(self):
         code, _, _ = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": False}, {})}, False, ["--fail-on-high"])
         self.assertEqual(code, 1)
+
+
+UNPROTECTED = {f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": False}, {}), f"/repos/{REPO}/rules/branches/main": (200, [], {})}
+
+
+def ruleset(cmd):
+    """The body and the request of a printed fix command, read back the way a shell would."""
+    toks = shlex.split(cmd)
+    return json.loads(toks[1]), toks[2:]
+
+
+class FixPath(unittest.TestCase):
+    """From a finding to its fix, to the agent's own identity, to the guard (entry 197)."""
+
+    def test_an_unprotected_branch_comes_with_the_command_that_protects_it(self):
+        _, rep, files = run(UNPROTECTED, authenticated=False)
+        f = rep["findings"][0]
+        body, req = ruleset(f["apply"])
+        self.assertEqual(req, ["|", "gh", "api", "--method", "POST", f"repos/{REPO}/rulesets", "--input", "-"])
+        self.assertEqual((body["target"], body["enforcement"], body["conditions"]["ref_name"]["include"]), ("branch", "active", ["refs/heads/main"]))
+        self.assertEqual([r["type"] for r in body["rules"]], ["deletion", "non_fast_forward", "pull_request"])
+        prm = body["rules"][2]["parameters"]                                                     # every parameter GitHub's API marks required
+        self.assertEqual(set(prm), {"required_approving_review_count", "dismiss_stale_reviews_on_push", "require_code_owner_review",
+                                    "require_last_push_approval", "required_review_thread_resolution"})
+        self.assertEqual((prm["required_approving_review_count"], prm["require_code_owner_review"]), (1, True))   # a declared code owner must approve
+        self.assertNotIn("bypass_actors", body)                                                 # for a team, no one skips review
+        solo, solo_req = ruleset(f["apply_solo"])
+        self.assertEqual(solo_req, req)
+        self.assertEqual(solo["bypass_actors"], [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "pull_request"}])   # admins, pull requests only
+        self.assertEqual({k: v for k, v in solo.items() if k != "bypass_actors"}, body)          # otherwise the same rules: one approval, no direct push
+        self.assertEqual(f["apply_note"], "")                                                    # a public repository: no plan caveat
+        self.assertIn(f"```bash\n{f['apply']}\n```\n\n{A.SOLO}\n\n```bash\n{f['apply_solo']}\n```", files["report.md"])
+        self.assertEqual(files["report.html"].count("<pre><code>echo "), 2)
+        private = run({**UNPROTECTED, f"/repos/{REPO}": repo(private=True)}, authenticated=False)[1]
+        self.assertIn("free plans may not offer rulesets", private["findings"][0]["apply_note"])
+        self.assertEqual(rep["recheck"], [f"Run the check again: `agent-authority-check --repo {REPO}`. The finding you fixed should be gone."])
+
+    def test_a_branch_protected_only_against_deletion_gets_only_the_missing_rule(self):
+        _, rep, _ = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": True, "protection": {"enabled": False}}, {}),
+                         f"/repos/{REPO}/rules/branches/main": (200, [{"type": "deletion"}, {"type": "non_fast_forward"}], {})}, authenticated=False)
+        body, _ = ruleset(rep["findings"][0]["apply"])
+        self.assertEqual([r["type"] for r in body["rules"]], ["pull_request"])
+
+    def test_branch_names_survive_the_shell(self):
+        b = "release/it's"
+        q = "release%2Fit%27s"
+        _, rep, _ = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/{q}": (200, {"protected": False}, {}),
+                         f"/repos/{REPO}/rules/branches/{q}": (200, [], {})}, False, ["--branch", b])
+        body, _ = ruleset(rep["findings"][0]["apply"])
+        self.assertEqual(body["conditions"]["ref_name"]["include"], [f"refs/heads/{b}"])
+        self.assertEqual(shlex.split(rep["recheck"][0].split("`")[1])[-2:], ["--branch", b])
+
+    def test_a_credential_that_can_switch_protection_off_leads_to_the_agents_own_identity(self):
+        _, rep, _ = run({"/user": (200, {"login": "agent-bot"}, {}), f"/repos/{REPO}": repo({"admin": True, "push": True}, "repo"),
+                         f"/repos/{REPO}/branches/main": (200, {"protected": True}, {}), f"/repos/{REPO}/rules/branches/main": (200, [PR], {})})
+        f = rep["findings"][0]
+        self.assertEqual((f["id"], f["fix"], f["apply"]), ("credential-can-change-protection", A.AGENT_IDENTITY, None))   # no command can do this for you
+        self.assertIn('GITHUB_TOKEN="$AGENT_TOKEN" agent-authority-check --repo acme/app', rep["recheck"][1])
+        ok = run({"/user": (200, {"login": "agent-bot"}, {}), f"/repos/{REPO}": repo({"admin": False, "push": True}, "repo"),
+                  f"/repos/{REPO}/branches/main": (200, {"protected": True}, {}), f"/repos/{REPO}/rules/branches/main": (200, [PR], {})})[1]
+        title = [x["title"] for x in ok["findings"] if x["id"] == "credential-cannot-change-protection"][0]
+        self.assertIn(f'"{title}"', rep["recheck"][1])                                          # the promised result is the check's own words
+
+    def test_the_report_ends_with_the_guard_and_the_terminal_stays_plain(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            _, rep, files = run(UNPROTECTED, authenticated=False)
+        md = files["report.md"]
+        self.assertGreater(md.index("### Beyond branch settings"), md.index("### How this was checked"))
+        self.assertIn("Fix the findings above first", md)
+        for name in ("report.md", "report.html"):
+            self.assertIn(A.GUARD_URL, files[name])
+            self.assertNotIn(A.CONTACT, files[name])
+        self.assertIn(f"<a href='{A.GUARD_URL}'>", files["report.html"])
+        self.assertNotIn("guard", out.getvalue().lower())
+        clean = [{"type": "pull_request", "parameters": PR["parameters"]}, {"type": "non_fast_forward"}]
+        _, _, files = run({"/user": (200, {"login": "agent-bot"}, {}), f"/repos/{REPO}": repo({"admin": False, "push": True}, "repo"),
+                           f"/repos/{REPO}/branches/main": (200, {"protected": True}, {}), f"/repos/{REPO}/rules/branches/main": (200, clean, {}),
+                           f"/repos/{REPO}/contents/.github/CODEOWNERS?ref=main": codeowners("* @lead\n/.github/ @lead\n")})
+        self.assertIn("### Beyond branch settings", files["report.md"])
+        self.assertNotIn("Fix the findings above first", files["report.md"])
+        self.assertNotIn("### After a fix", files["report.md"])
+
+
+PR = {"type": "pull_request", "parameters": {"required_approving_review_count": 1, "require_code_owner_review": True, "require_last_push_approval": True,
+                                             "dismiss_stale_reviews_on_push": True}}
 
 
 class Failures(unittest.TestCase):

@@ -16,6 +16,7 @@ import html
 import json
 import os
 import re
+import shlex
 import shutil
 import ssl
 import subprocess
@@ -29,6 +30,7 @@ from pathlib import Path
 API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "OK": 3}
 CONTACT = "charles_337@me.com"
+GUARD_URL = "https://github.com/charles-337/agent-authority-check#beyond-branch-settings"
 
 
 class CheckError(Exception):
@@ -147,7 +149,7 @@ def collect(t, repo, branch=None):
         if s == 200 and isinstance(c, dict) and c.get("content"):
             co = {"text": base64.b64decode(c["content"]).decode("utf-8", "replace"), "path": path, "rids": [rid]}
             break
-    return {"repo": repo, "branch": branch, "login": login, "via": t.name, "authenticated": t.authenticated,
+    return {"repo": repo, "branch": branch, "default_branch": r.get("default_branch"), "login": login, "via": t.name, "authenticated": t.authenticated,
             "scopes": hdr.get("x-oauth-scopes"), "repo_rid": rid_repo, "permissions": r.get("permissions"), "private": r.get("private"),
             "protected": (br or {}).get("protected"), "classic_enabled": ((br or {}).get("protection") or {}).get("enabled"), "branch_rid": rid_branch,
             "protection": prot if s_prot == 200 else None, "protection_status": s_prot, "protection_rid": rid_prot,
@@ -183,6 +185,41 @@ def _curl(d, path, grep=None, auth=False, raw=False):
     return f'curl -s{"i" if grep and "scopes" in grep else ""}{h} "{API}{path}"' + (f" | grep -i -E '{grep}'" if grep else "")
 
 
+PR_RULE = {"type": "pull_request", "parameters": {"required_approving_review_count": 1, "dismiss_stale_reviews_on_push": True, "require_code_owner_review": True,
+                                                  "require_last_push_approval": True, "required_review_thread_resolution": False}}
+ADMIN_MERGES = [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "pull_request"}]   # role 5 is the repository admin role
+SOLO = ("Working alone? Nobody else can approve your pull requests, so run this instead. It lets repository admins, meaning you, merge a pull "
+        "request without another approval, and nothing else: no one may push directly, and anyone without admin rights, an agent included, "
+        "still needs someone else's approval, which in a repository you run alone means yours. An agent holding an admin's credential could "
+        "merge the same way, which is why the credential finding matters.")
+
+
+def _ruleset(d, name, rules, bypass=None):
+    """The command that adds the missing ruleset (POST /repos/{owner}/{repo}/rulesets, fields as GitHub documents them). The reader runs it as a
+    repository admin; this check itself never writes."""
+    body = {"name": name, "target": "branch", "enforcement": "active", "conditions": {"ref_name": {"include": [f"refs/heads/{d['branch']}"], "exclude": []}},
+            "rules": rules, **({"bypass_actors": bypass} if bypass else {})}
+    return f'echo {shlex.quote(json.dumps(body, separators=(",", ":")))} | gh api --method POST "repos/{d["repo"]}/rulesets" --input -'
+
+
+AGENT_IDENTITY = ("Give the agent its own GitHub identity, with write access and never admin: a machine account added as a collaborator with write access, "
+                  "or a GitHub App with Contents and Pull requests set to read and write and Administration set to no access. Give the agent only that "
+                  "identity's token, keep admin with people, and run the agent where it cannot reach their credentials.")
+
+
+def _private(d):
+    return " On a private repository, GitHub's free plans may not offer rulesets; its answer will say so." if d["private"] else ""
+
+
+def _rerun(d, token=False):
+    return ('GITHUB_TOKEN="$AGENT_TOKEN" ' if token else "") + f"agent-authority-check --repo {d['repo']}" + (
+        f" --branch {shlex.quote(d['branch'])}" if d["branch"] != d.get("default_branch") else "")
+
+
+def _approvals(n):
+    return f"{n} approval" + ("" if n == 1 else "s")
+
+
 def _protects(d):
     """What the check could see protecting the branch, in words."""
     rules, prot = d["rules"] or [], d["protection"]
@@ -191,14 +228,14 @@ def _protects(d):
         w = RULE_WORDS.get(r.get("type"), r.get("type"))
         prm = r.get("parameters") or {}
         if r.get("type") == "pull_request":
-            w += f" ({prm.get('required_approving_review_count', 0)} approvals" + (", code-owner review" if prm.get("require_code_owner_review") else "") + ")"
+            w += f" ({_approvals(prm.get('required_approving_review_count', 0))}" + (", code-owner review" if prm.get("require_code_owner_review") else "") + ")"
         if w not in words:
             words.append(w)
     if d["classic_enabled"] is False:
         classic = "off (public branch data: protection.enabled = false)"
     elif prot:
         rv = prot.get("required_pull_request_reviews")
-        classic = "on: " + (f"pull request with {rv.get('required_approving_review_count', 0)} approvals" + (", code-owner review" if rv.get("require_code_owner_reviews") else "")
+        classic = "on: " + (f"pull request with {_approvals(rv.get('required_approving_review_count', 0))}" + (", code-owner review" if rv.get("require_code_owner_reviews") else "")
                             if rv else "no pull request required") + ("; administrators included" if (prot.get("enforce_admins") or {}).get("enabled") else "; administrators not included")
     elif d["classic_enabled"]:
         classic = "on (its settings are visible only to repository admins)"
@@ -214,8 +251,11 @@ def findings(d):
     pr = [x.get("parameters") or {} for x in rules if x.get("type") == "pull_request"]
     rv = (prot or {}).get("required_pull_request_reviews")
 
-    def add(sev, key, title, detail, evidence, verify, fix, expect=""):
-        F.append({"severity": sev, "id": key, "title": title, "detail": detail, "evidence": evidence, "verify": verify, "expect": expect, "fix": fix})
+    def add(sev, key, title, detail, evidence, verify, fix, expect="", ruleset=None):
+        name, rs = ruleset or (None, None)
+        F.append({"severity": sev, "id": key, "title": title, "detail": detail, "evidence": evidence, "verify": verify, "expect": expect, "fix": fix,
+                  "apply": _ruleset(d, name, rs) if rs else None, "apply_solo": _ruleset(d, name, rs, ADMIN_MERGES) if rs else None,
+                  "apply_note": _private(d) if rs else ""})
 
     # 1. Is there anything between an agent's commit and the branch?
     if d["protected"] is False and not rules:
@@ -225,8 +265,10 @@ def findings(d):
                                                                               if d["codeowners"]["text"] else ""),
             [f"{d['branch_rid']}: protected = false", f"{d['rules_rid']}: no rules apply to this branch"],
             _curl(d, f"/repos/{repo}/branches/{qb}", '"protected"|"enabled"') + "; " + _curl(d, f"/repos/{repo}/rules/branches/{qb}"),
-            f"Protect `{br}` (Settings › Rules or Branches): require a pull request with at least one approval, and block force-pushes and deletion.",
-            '"protected": false and "enabled": false, then [] (no rules)')
+            f"Protect `{br}` (Settings › Rules or Branches): require a pull request with at least one approval, from a code owner where a CODEOWNERS "
+            "file names one, and block force-pushes and deletion.",
+            '"protected": false and "enabled": false, then [] (no rules)',
+            (f"Protect {br}", [{"type": "deletion"}, {"type": "non_fast_forward"}, PR_RULE]))
     if d["protected"] and d["classic_enabled"] is False and rules and not BLOCKING & {x.get("type") for x in rules}:
         add("HIGH", "no-pull-request-required", f"Nothing requires a pull request before commits land on `{br}`.",
             f"The only rules on `{br}` are: {'; '.join(_protects(d)[1][len('Rulesets: '):].split('; '))}. Classic branch protection is off, so any credential with write "
@@ -234,7 +276,8 @@ def findings(d):
             [f"{d['branch_rid']}: protected = true, protection.enabled = false", f"{d['rules_rid']}: rule types = {', '.join(sorted({x.get('type') for x in rules}))}"],
             _curl(d, f"/repos/{repo}/branches/{qb}", '"enabled"') + "; " + _curl(d, f"/repos/{repo}/rules/branches/{qb}", '"type"'),
             f"Add a ruleset rule for `{br}` that requires a pull request with at least one approval.",
-            f'"enabled": false, then only the types {", ".join(sorted({x.get("type") for x in rules}))}')
+            f'"enabled": false, then only the types {", ".join(sorted({x.get("type") for x in rules}))}',
+            (f"Require a pull request on {br}", [PR_RULE]))
     # 2. Review rules, where they are visible (rulesets are visible to anyone who can read the repository; classic settings need admin to read)
     reviews = [rv.get("required_approving_review_count", 0)] if rv else []
     reviews += [x.get("required_approving_review_count", 0) for x in pr]
@@ -268,14 +311,13 @@ def findings(d):
                 "it can edit or delete branch protection and rulesets. If an agent uses this credential, no branch rule holds against it.",
                 [f"{d['repo_rid']}: permissions.admin = true", f"{d['repo_rid']}: response header X-OAuth-Scopes = {scopes}"],
                 _curl(d, f"/repos/{repo}", 'x-oauth-scopes|"admin"', auth=True), expect='x-oauth-scopes listing repo, and "admin": true',
-                fix="Give the agent its own identity (a machine account or a GitHub App) with write access only, never admin. Keep admin with people, "
-                "and run the agent where it cannot reach their credentials.")
+                fix=AGENT_IDENTITY)
         else:
             add("MEDIUM", "account-is-admin", f"{who} belongs to an admin of {repo}; whether this token can use those rights cannot be determined here.",
                 "The account is an admin. Fine-grained and app tokens do not reveal their own permissions to a read-only check, so whether this token "
                 "could change protection is unknown. If it was created with 'Administration: write', it can.",
                 [f"{d['repo_rid']}: permissions.admin = true", f"{d['repo_rid']}: X-OAuth-Scopes = {scopes or 'absent (not a classic token)'}"],
-                _curl(d, f"/repos/{repo}", '"admin"', auth=True), "Use an identity that is not an admin for agents.")
+                _curl(d, f"/repos/{repo}", '"admin"', auth=True), AGENT_IDENTITY)
     elif perms:
         add("OK", "credential-cannot-change-protection", "This credential cannot change the repository's protections.",
             f"{who} has {'write' if perms.get('push') else 'read'} access, without admin or maintain rights.",
@@ -317,10 +359,14 @@ def build(d):
                    + ("." if d["authenticated"] else "; run with your agent's token to see what that credential may do."))
     else:
         verdict = "No authority gap found in what this check can see. See what it could not determine below."
+    recheck = [f"Run the check again: `{_rerun(d)}`. The finding you fixed should be gone."] if risky else []
+    if {"credential-can-change-protection", "account-is-admin"} & {f["id"] for f in F}:
+        recheck.append(f"With the agent's new token: `{_rerun(d, token=True)}`. A machine account with write access should show "
+                       "\"This credential cannot change the repository's protections.\"")
     return {"tool": "Haven Agent Authority Check", "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "repository": d["repo"],
             "branch": d["branch"], "credential": (f"{d['login'] or 'a token with no user (for example a workflow token)'} (via {d['via']})" if d["authenticated"]
                                                    else "none: the public view"),
-            "verdict": verdict, "protects": _protects(d), "findings": F, "cannot_determine": unknown,
+            "verdict": verdict, "protects": _protects(d), "findings": F, "recheck": recheck, "cannot_determine": unknown,
             "counts": {s: sum(1 for f in F if f["severity"] == s) for s in ORDER},
             "limits": "Read-only: only GET requests, nothing changed. Findings are configuration facts read from GitHub; they show what is configured and what a "
                       "credential is permitted to do, not what GitHub will refuse in practice.", "evidence": d["log"]}
@@ -339,6 +385,21 @@ def anonymize(rep, d):
 
 
 FOOTER = "Generated by the Haven Agent Authority Check: read-only, no data sent anywhere but GitHub's API."
+APPLY = "Apply it as a repository admin, logged in with `gh` (this check itself changes nothing):"
+BEYOND = ["Branch rules decide what may land on a branch. They treat every pull request the same, whoever wrote it, and they see nothing an agent does "
+          "before it pushes. Haven's guard adds, for coding agents:",
+          ["one authority rule per agent: what it may merge itself, what needs a person's signed approval of that exact change, and what it may never touch;",
+           "a check inside the agent's session (a Claude Code hook) that stops a protected action before it runs, including edits to its own rules or keys;",
+           "a receipt for every decision, hash-chained so that an edited receipt is caught."],
+          f"Shown so far with a live Claude Code agent in a sandbox, not yet on GitHub itself. How it works: {GUARD_URL}"]
+
+
+def _beyond(rep):
+    """The last section: what branch settings cannot do, and the guard. Fixing the findings comes first, because the guard holds only where the
+    agent's own credential cannot switch the branch rules off."""
+    first = ("Fix the findings above first: the guard does not replace branch rules, and it holds only where the agent's own credential cannot "
+             "switch them off. " if (rep.get("counts") or {}).get("HIGH") or (rep.get("counts") or {}).get("MEDIUM") else "")
+    return first + BEYOND[0], BEYOND[1], BEYOND[2]
 
 
 def markdown(rep):
@@ -349,9 +410,16 @@ def markdown(rep):
         L += [f"### {f['severity']}: {f['title']}", "", f["detail"], "", f"- Evidence: {'; '.join(f['evidence'])}",
               f"- Check it yourself: `{f['verify']}`" + (f" (expect {f['expect']})" if f.get("expect") else ""),
               f"- Fix: {f['fix']}", ""]
+        if f.get("apply"):
+            L += [APPLY, "", "```bash", f["apply"], "```", "", SOLO, "", "```bash", f["apply_solo"], "```", ""]
+            L += [f["apply_note"].strip(), ""] if f.get("apply_note") else []
+    if rep.get("recheck"):
+        L += ["### After a fix", ""] + [f"- {x}" for x in rep["recheck"]] + [""]
     L += ["### Cannot be determined from here", ""] + [f"- {x}" for x in rep["cannot_determine"]] + [""]
     L += ["### How this was checked", "", rep["limits"], "", "| | Request | HTTP |", "|---|---|---|"]
     L += [f"| {r['id']} | `GET {r['endpoint']}` | {r['status']} |" for r in rep["evidence"]]
+    lead, points, last = _beyond(rep)
+    L += ["", "### Beyond branch settings", "", lead, ""] + [f"- {x}" for x in points] + ["", last]
     return "\n".join(L + ["", f"_{FOOTER}_", ""])
 
 
@@ -365,7 +433,8 @@ def page(rep):
            "h1{font-size:1.3rem}.v{font-size:1.15rem;font-weight:700}.mut{color:var(--mut)}.card{background:var(--card);border:1px solid var(--line);border-radius:10px;"
            "padding:12px 16px;margin:12px 0}.s{font-weight:700;font-size:.8rem}.HIGH{color:var(--HIGH)}.MEDIUM{color:var(--MEDIUM)}.LOW{color:var(--LOW)}.OK{color:var(--OK)}"
            "code{font-size:.85em;word-break:break-all}table{border-collapse:collapse;width:100%;font-size:.85rem}td,th{border-bottom:1px solid var(--line);padding:6px;text-align:left}"
-           ".wrap{overflow-x:auto}")
+           ".wrap{overflow-x:auto}pre{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px 10px;white-space:pre-wrap;word-break:break-all}"
+           "a{color:inherit}")
     out = [f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Agent Authority Check</title>"
            f"<style>{css}</style></head><body><main><h1>Agent Authority Check · {e(rep['repository'])} @ <code>{e(rep['branch'])}</code></h1>"
            f"<p class='v'>{md(rep['verdict'])}</p><p class='mut'>Credential: {e(rep['credential'])} · {e(rep['generated_at'])}</p>"
@@ -374,11 +443,19 @@ def page(rep):
     for f in rep["findings"]:
         out.append(f"<div class='card'><span class='s {f['severity']}'>{f['severity']}</span> <strong>{md(f['title'])}</strong><p>{md(f['detail'])}</p>"
                    f"<p class='mut'>Evidence: {md('; '.join(f['evidence']))}</p><p>Check it yourself: <code>{e(f['verify'])}</code>"
-                   + (f" <span class='mut'>(expect {e(f['expect'])})</span>" if f.get("expect") else "") + f"</p><p>Fix: {md(f['fix'])}</p></div>")
+                   + (f" <span class='mut'>(expect {e(f['expect'])})</span>" if f.get("expect") else "") + f"</p><p>Fix: {md(f['fix'])}</p>"
+                   + (f"<p>{md(APPLY)}</p><pre><code>{e(f['apply'])}</code></pre><p>{md(SOLO)}</p><pre><code>{e(f['apply_solo'])}</code></pre>"
+                      + (f"<p class='mut'>{md(f['apply_note'].strip())}</p>" if f.get("apply_note") else "") if f.get("apply") else "") + "</div>")
+    if rep.get("recheck"):
+        out.append("<h2>After a fix</h2><ul>" + "".join(f"<li>{md(x)}</li>" for x in rep["recheck"]) + "</ul>")
     out.append("<h2>Cannot be determined from here</h2><ul>" + "".join(f"<li>{md(x)}</li>" for x in rep["cannot_determine"]) + "</ul>")
     out.append(f"<h2>How this was checked</h2><p>{e(rep['limits'])}</p><div class='wrap'><table><tr><th></th><th>Request</th><th>HTTP</th></tr>")
     out += [f"<tr><td>{r['id']}</td><td><code>GET {e(r['endpoint'])}</code></td><td>{r['status']}</td></tr>" for r in rep["evidence"]]
-    out.append(f"</table></div><p class='mut'><em>{e(FOOTER)}</em></p></main></body></html>")
+    lead, points, last = _beyond(rep)
+    link = f"<a href='{e(GUARD_URL)}'>{e(GUARD_URL)}</a>"
+    out.append(f"</table></div><h2>Beyond branch settings</h2><p>{md(lead)}</p><ul>" + "".join(f"<li>{md(x)}</li>" for x in points) + "</ul>"
+               f"<p>{md(last).replace(e(GUARD_URL), link)}</p>")
+    out.append(f"<p class='mut'><em>{e(FOOTER)}</em></p></main></body></html>")
     return "\n".join(out)
 
 
