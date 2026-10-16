@@ -187,6 +187,8 @@ def _curl(d, path, grep=None, auth=False, raw=False):
 
 PR_RULE = {"type": "pull_request", "parameters": {"required_approving_review_count": 1, "dismiss_stale_reviews_on_push": True, "require_code_owner_review": True,
                                                   "require_last_push_approval": True, "required_review_thread_resolution": False}}
+REVIEW = ("a pull request with at least one approval, from a code owner where a CODEOWNERS file names one; a new push dismisses earlier approvals, "
+          "and the last push must be approved by someone other than whoever pushed it")                # PR_RULE, in words
 ADMIN_MERGES = [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "pull_request"}]   # role 5 is the repository admin role
 SOLO = ("Working alone? Nobody else can approve your pull requests, so run this instead. It lets repository admins, meaning you, merge a pull "
         "request without another approval, and nothing else: no one may push directly, and anyone without admin rights, an agent included, "
@@ -220,6 +222,11 @@ def _approvals(n):
     return f"{n} approval" + ("" if n == 1 else "s")
 
 
+def _co(d):
+    """A code-owner rule, in words; with no CODEOWNERS file it requires nothing, and says so."""
+    return ", code-owner review" + ("" if d["codeowners"]["text"] else " (no CODEOWNERS file, so no owner is required)")
+
+
 def _protects(d):
     """What the check could see protecting the branch, in words."""
     rules, prot = d["rules"] or [], d["protection"]
@@ -228,14 +235,14 @@ def _protects(d):
         w = RULE_WORDS.get(r.get("type"), r.get("type"))
         prm = r.get("parameters") or {}
         if r.get("type") == "pull_request":
-            w += f" ({_approvals(prm.get('required_approving_review_count', 0))}" + (", code-owner review" if prm.get("require_code_owner_review") else "") + ")"
+            w += f" ({_approvals(prm.get('required_approving_review_count', 0))}" + (_co(d) if prm.get("require_code_owner_review") else "") + ")"
         if w not in words:
             words.append(w)
     if d["classic_enabled"] is False:
         classic = "off (public branch data: protection.enabled = false)"
     elif prot:
         rv = prot.get("required_pull_request_reviews")
-        classic = "on: " + (f"pull request with {_approvals(rv.get('required_approving_review_count', 0))}" + (", code-owner review" if rv.get("require_code_owner_reviews") else "")
+        classic = "on: " + (f"pull request with {_approvals(rv.get('required_approving_review_count', 0))}" + (_co(d) if rv.get("require_code_owner_reviews") else "")
                             if rv else "no pull request required") + ("; administrators included" if (prot.get("enforce_admins") or {}).get("enabled") else "; administrators not included")
     elif d["classic_enabled"]:
         classic = "on (its settings are visible only to repository admins)"
@@ -265,8 +272,7 @@ def findings(d):
                                                                               if d["codeowners"]["text"] else ""),
             [f"{d['branch_rid']}: protected = false", f"{d['rules_rid']}: no rules apply to this branch"],
             _curl(d, f"/repos/{repo}/branches/{qb}", '"protected"|"enabled"') + "; " + _curl(d, f"/repos/{repo}/rules/branches/{qb}"),
-            f"Protect `{br}` (Settings › Rules or Branches): require a pull request with at least one approval, from a code owner where a CODEOWNERS "
-            "file names one, and block force-pushes and deletion.",
+            f"Protect `{br}` (Settings › Rules or Branches): require {REVIEW}; block force-pushes and deletion.",
             '"protected": false and "enabled": false, then [] (no rules)',
             (f"Protect {br}", [{"type": "deletion"}, {"type": "non_fast_forward"}, PR_RULE]))
     if d["protected"] and d["classic_enabled"] is False and rules and not BLOCKING & {x.get("type") for x in rules}:
@@ -274,9 +280,9 @@ def findings(d):
             f"The only rules on `{br}` are: {'; '.join(_protects(d)[1][len('Rulesets: '):].split('; '))}. Classic branch protection is off, so any credential with write "
             "access, including a token you give a coding agent, can push commits straight to it.",
             [f"{d['branch_rid']}: protected = true, protection.enabled = false", f"{d['rules_rid']}: rule types = {', '.join(sorted({x.get('type') for x in rules}))}"],
-            _curl(d, f"/repos/{repo}/branches/{qb}", '"enabled"') + "; " + _curl(d, f"/repos/{repo}/rules/branches/{qb}", '"type"'),
-            f"Add a ruleset rule for `{br}` that requires a pull request with at least one approval.",
-            f'"enabled": false, then only the types {", ".join(sorted({x.get("type") for x in rules}))}',
+            _curl(d, f"/repos/{repo}/branches/{qb}", '"protected"|"enabled"') + "; " + _curl(d, f"/repos/{repo}/rules/branches/{qb}", '"type"'),
+            f"Add a ruleset rule for `{br}` that requires {REVIEW}.",
+            f'"protected": true and "enabled": false, then only the types {", ".join(sorted({x.get("type") for x in rules}))}',
             (f"Require a pull request on {br}", [PR_RULE]))
     # 2. Review rules, where they are visible (rulesets are visible to anyone who can read the repository; classic settings need admin to read)
     reviews = [rv.get("required_approving_review_count", 0)] if rv else []
@@ -325,8 +331,10 @@ def findings(d):
     # 4. Who owns the files that govern the repository
     co = d["codeowners"]
     if co["text"] is None:
+        asks = (rv or {}).get("require_code_owner_reviews") or any(x.get("require_code_owner_review") for x in pr)
         add("LOW", "no-codeowners", "No code owner is assigned to the workflows or review rules.",
-            "There is no CODEOWNERS file, so changes to .github/ (including the workflows that run your checks) cannot require an owner's review. "
+            "There is no CODEOWNERS file, so " + (f"the rule on `{br}` that asks for code-owner review requires nothing, and " if asks else "")
+            + "changes to .github/ (including the workflows that run your checks) cannot require an owner's review. "
             "GitHub's guidance is to name an owner for the CODEOWNERS file itself.", [f"{', '.join(co['rids'])}: no CODEOWNERS file found"],
             _curl(d, f"/repos/{repo}/contents/.github/CODEOWNERS?ref={qb}", '"message"'), "Add .github/CODEOWNERS naming a person for /.github/ and for the file itself.",
             '"message": "Not Found"')
@@ -365,7 +373,7 @@ def build(d):
                        "\"This credential cannot change the repository's protections.\"")
     return {"tool": "Haven Agent Authority Check", "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "repository": d["repo"],
             "branch": d["branch"], "credential": (f"{d['login'] or 'a token with no user (for example a workflow token)'} (via {d['via']})" if d["authenticated"]
-                                                   else "none: the public view"),
+                                                   else "none (the public view)"),
             "verdict": verdict, "protects": _protects(d), "findings": F, "recheck": recheck, "cannot_determine": unknown,
             "counts": {s: sum(1 for f in F if f["severity"] == s) for s in ORDER},
             "limits": "Read-only: only GET requests, nothing changed. Findings are configuration facts read from GitHub; they show what is configured and what a "
@@ -386,12 +394,10 @@ def anonymize(rep, d):
 
 FOOTER = "Generated by the Haven Agent Authority Check: read-only, no data sent anywhere but GitHub's API."
 APPLY = "Apply it as a repository admin, logged in with `gh` (this check itself changes nothing):"
-BEYOND = ["Branch rules decide what may land on a branch. They treat every pull request the same, whoever wrote it, and they see nothing an agent does "
-          "before it pushes. Haven's guard adds, for coding agents:",
-          ["one authority rule per agent: what it may merge itself, what needs a person's signed approval of that exact change, and what it may never touch;",
-           "a check inside the agent's session (a Claude Code hook) that stops a protected action before it runs, including edits to its own rules or keys;",
-           "a receipt for every decision, hash-chained so that an edited receipt is caught."],
-          f"Shown so far with a live Claude Code agent in a sandbox, not yet on GitHub itself. How it works: {GUARD_URL}"]
+BEYOND = ("This check is free. Haven, which publishes it, also builds a guard for coding agents, because branch rules treat every pull request the "
+          "same, whoever wrote it: one authority rule per agent (what it may merge itself, what needs a person's signed approval of that exact change, "
+          "and what it may never touch), a check inside the agent's session that stops a protected action before it runs, and a receipt for every decision.")
+BEYOND_LAST = f"Shown in a sandbox, not yet on GitHub. Details: {GUARD_URL}"
 
 
 def _beyond(rep):
@@ -399,7 +405,7 @@ def _beyond(rep):
     agent's own credential cannot switch the branch rules off."""
     first = ("Fix the findings above first: the guard does not replace branch rules, and it holds only where the agent's own credential cannot "
              "switch them off. " if (rep.get("counts") or {}).get("HIGH") or (rep.get("counts") or {}).get("MEDIUM") else "")
-    return first + BEYOND[0], BEYOND[1], BEYOND[2]
+    return first + BEYOND, BEYOND_LAST
 
 
 def markdown(rep):
@@ -418,8 +424,8 @@ def markdown(rep):
     L += ["### Cannot be determined from here", ""] + [f"- {x}" for x in rep["cannot_determine"]] + [""]
     L += ["### How this was checked", "", rep["limits"], "", "| | Request | HTTP |", "|---|---|---|"]
     L += [f"| {r['id']} | `GET {r['endpoint']}` | {r['status']} |" for r in rep["evidence"]]
-    lead, points, last = _beyond(rep)
-    L += ["", "### Beyond branch settings", "", lead, ""] + [f"- {x}" for x in points] + ["", last]
+    lead, last = _beyond(rep)
+    L += ["", "### Beyond branch settings", "", lead, "", last]
     return "\n".join(L + ["", f"_{FOOTER}_", ""])
 
 
@@ -451,10 +457,9 @@ def page(rep):
     out.append("<h2>Cannot be determined from here</h2><ul>" + "".join(f"<li>{md(x)}</li>" for x in rep["cannot_determine"]) + "</ul>")
     out.append(f"<h2>How this was checked</h2><p>{e(rep['limits'])}</p><div class='wrap'><table><tr><th></th><th>Request</th><th>HTTP</th></tr>")
     out += [f"<tr><td>{r['id']}</td><td><code>GET {e(r['endpoint'])}</code></td><td>{r['status']}</td></tr>" for r in rep["evidence"]]
-    lead, points, last = _beyond(rep)
+    lead, last = _beyond(rep)
     link = f"<a href='{e(GUARD_URL)}'>{e(GUARD_URL)}</a>"
-    out.append(f"</table></div><h2>Beyond branch settings</h2><p>{md(lead)}</p><ul>" + "".join(f"<li>{md(x)}</li>" for x in points) + "</ul>"
-               f"<p>{md(last).replace(e(GUARD_URL), link)}</p>")
+    out.append(f"</table></div><h2>Beyond branch settings</h2><p>{md(lead)}</p><p>{md(last).replace(e(GUARD_URL), link)}</p>")
     out.append(f"<p class='mut'><em>{e(FOOTER)}</em></p></main></body></html>")
     return "\n".join(out)
 

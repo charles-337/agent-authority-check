@@ -37,7 +37,7 @@ When the fix is a setting, the report also prints the exact command that applies
 
 The full example is in [`examples/agent-authority-report/report.md`](examples/agent-authority-report/report.md). It comes from a real run with the names hidden.
 
-The check comes from Haven's Change Passport, which enforces exact-change approvals for AI agents. It is licensed under Apache-2.0.
+The check is free and licensed under Apache-2.0. It is published by Haven, which builds controls for AI coding agents (see [Beyond branch settings](#beyond-branch-settings)).
 
 ## What it looks for
 
@@ -83,7 +83,12 @@ The report appears in the run's summary. The check uses only Python's standard l
 
 ## Fixing what it finds
 
-- **Nothing stops a direct push, or nothing requires a pull request:** the report prints one `gh api` command that adds the missing ruleset: a pull request with one approval, from a code owner where a CODEOWNERS file names one, and no force-push or deletion. You run it as a repository admin; the check itself never writes. If you work alone, nobody else can approve your pull requests, so the report prints a second command to use instead. It lets repository admins merge a pull request without another approval, and nothing more: no one may push directly, and anyone without admin rights, an agent included, still needs someone else's approval.
+- **Nothing stops a direct push, or nothing requires a pull request:** the report prints one `gh api` command that adds the missing ruleset. Read its JSON before you run it; it asks for:
+  - a pull request with at least one approval, from a code owner where a CODEOWNERS file names one (with no CODEOWNERS file, that part requires nothing);
+  - approvals dismissed when new commits are pushed, and the last push approved by someone other than whoever pushed it, so a change can't be altered after approval;
+  - no force-push and no deletion.
+
+  You run it as a repository admin; the check itself never writes. If you work alone, nobody else can approve your pull requests, so the report prints a second command to use instead. It lets repository admins merge a pull request without another approval, and nothing more: no one may push directly, and anyone without admin rights, an agent included, still needs someone else's approval.
 - **The credential can switch protection off:** no command can fix this for you. Give the agent its own identity with write access only, either a machine account or a GitHub App, and give the agent only that identity's token. Then run the check again with that token.
 - After each fix, run the check again. The finding you fixed should be gone.
 
@@ -93,15 +98,18 @@ Branch rules decide what may land on a branch. They treat every pull request the
 
 - **One authority rule per agent:** what it may merge itself, what needs a person's signed approval of that exact change, and what it may never touch.
 - **A check inside the agent's session:** a Claude Code hook stops a protected action before it runs, including edits to the agent's own rules or keys.
-- **A receipt for every decision:** hash-chained, so an edited receipt is caught.
+- **A receipt for every decision:** hash-chained, so an edited receipt is caught. Rewriting the whole chain is caught only against a copy of its last hash kept somewhere else.
 
-**What has been shown, in a sandbox with a live Claude Code agent:**
+**What has been shown, in a sandbox with a live Claude Code agent.** A local repository stood in for GitHub, with Haven's check running inside it instead of GitHub's review rules:
 - the agent's routine change was allowed and reached main with no review;
 - its push of a production change was stopped before it ran, because no one had signed an approval of that exact change;
-- the same commit, pushed separately with the hook out of the way, was refused by the protected repository's own check;
+- the same commit, pushed separately with the hook out of the way, was refused by that repository's own check;
 - its attempt to edit the guard's settings was refused.
 
-**Not yet shown:** enforcement on GitHub itself. The guard is a boundary only where the agent's own credential can't switch the branch rules off, which is why the fixes above come first.
+**Not yet shown: enforcement on GitHub itself.**
+- On GitHub, letting an agent merge routine changes without a person means replacing the approval rule above with a required check that only Haven can report. That is designed, not yet tested.
+- Until then, the fixes above require a person's approval for every agent change.
+- The guard is a boundary only where the agent's own credential can't switch the branch rules off, which is why those fixes come first.
 
 The guard isn't published. Haven sets it up for one agent workflow against a copy of your setup, then reports what it allowed, held and refused, with evidence you can check yourself.
 

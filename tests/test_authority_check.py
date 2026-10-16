@@ -54,7 +54,7 @@ class Findings(unittest.TestCase):
         self.assertEqual(rep["verdict"], "Nothing stops a direct push to `main`.")
         self.assertEqual([f["id"] for f in rep["findings"]], ["branch-unprotected", "no-codeowners"])
         self.assertTrue(any("GITHUB_TOKEN" in u for u in rep["cannot_determine"]))          # says what it could not see, and how to see it
-        self.assertEqual(rep["credential"], "none: the public view")
+        self.assertEqual(rep["credential"], "none (the public view)")
         self.assertIn("report.md", files)
         self.assertIn("report.html", files)
 
@@ -145,6 +145,11 @@ class FixPath(unittest.TestCase):
         self.assertEqual(set(prm), {"required_approving_review_count", "dismiss_stale_reviews_on_push", "require_code_owner_review",
                                     "require_last_push_approval", "required_review_thread_resolution"})
         self.assertEqual((prm["required_approving_review_count"], prm["require_code_owner_review"]), (1, True))   # a declared code owner must approve
+        self.assertIn(A.REVIEW, f["fix"])                                                        # the words name every review setting the command applies
+        for words, key in (("code owner", "require_code_owner_review"), ("dismisses earlier approvals", "dismiss_stale_reviews_on_push"),
+                           ("someone other than whoever pushed it", "require_last_push_approval")):
+            self.assertIn(words, A.REVIEW)
+            self.assertTrue(prm[key], key)
         self.assertNotIn("bypass_actors", body)                                                 # for a team, no one skips review
         solo, solo_req = ruleset(f["apply_solo"])
         self.assertEqual(solo_req, req)
@@ -162,6 +167,13 @@ class FixPath(unittest.TestCase):
                          f"/repos/{REPO}/rules/branches/main": (200, [{"type": "deletion"}, {"type": "non_fast_forward"}], {})}, authenticated=False)
         body, _ = ruleset(rep["findings"][0]["apply"])
         self.assertEqual([r["type"] for r in body["rules"]], ["pull_request"])
+
+    def test_a_code_owner_rule_without_a_codeowners_file_is_not_shown_as_protection(self):
+        """Found by the third stand-in stranger: the tool's own repository listed 'code-owner review' before it had a CODEOWNERS file."""
+        _, rep, _ = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": True, "protection": {"enabled": False}}, {}),
+                         f"/repos/{REPO}/rules/branches/main": (200, [PR], {})}, authenticated=False)
+        self.assertIn("Rulesets: require a pull request (1 approval, code-owner review (no CODEOWNERS file, so no owner is required))", rep["protects"])
+        self.assertIn("asks for code-owner review requires nothing", [f for f in rep["findings"] if f["id"] == "no-codeowners"][0]["detail"])
 
     def test_branch_names_survive_the_shell(self):
         b = "release/it's"
