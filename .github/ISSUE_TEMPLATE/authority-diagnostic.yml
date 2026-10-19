@@ -1,0 +1,67 @@
+name: Private diagnostic inquiry (sanitized)
+description: Ask about the $1,500, five-business-day Agent Authority Diagnostic. Do not post secrets, private reports, or financial records.
+title: "[Diagnostic inquiry] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Public issue warning:** GitHub issues may become public when the repository is published. This is an *inquiry*, not a purchase, an agreement, or consent to run commands.
+        Share only non-sensitive details. For private scope discussions email charles_337@me.com with subject "Haven Authority Diagnostic".
+  - type: dropdown
+    id: role
+    attributes:
+      label: Your role
+      description: No name or company required in the public issue.
+      options:
+        - Engineering owner
+        - Security owner
+        - Agent operator
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: finding
+    attributes:
+      label: Finding category
+      options:
+        - HIGH — branch/credential authority gap
+        - MEDIUM — review/approval gap
+        - Could not read key protection settings
+        - Interested in an authorized diagnostic; no scan yet
+    validations:
+      required: true
+  - type: dropdown
+    id: visibility
+    attributes:
+      label: Repository visibility
+      options:
+        - Public
+        - Private
+        - Prefer not to disclose
+    validations:
+      required: true
+  - type: dropdown
+    id: agent_identity
+    attributes:
+      label: Does the coding agent have its own scoped GitHub identity?
+      options:
+        - Yes
+        - No
+        - Unknown
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Sanitized question
+      description: No repo names, URLs for private repos, credentials, reports, customer data, or proprietary code.
+      placeholder: "Example: Our agent has write permission but branch rules require no reviews. We would like a scoped diagnostic."
+    validations:
+      required: true
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Acknowledgements
+      options:
+        - label: I have shared no secrets or private customer information; this inquiry authorizes no work and creates no payment obligation.
+          required: true
