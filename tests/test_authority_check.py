@@ -281,10 +281,253 @@ class Credentials(unittest.TestCase):
         for name in ("acme", "agent-bot", "jane"):
             self.assertNotIn(name, text)
 
+    def test_anonymize_also_masks_the_branch_name(self):
+        b, q = "alice/project-phoenix", "alice%2Fproject-phoenix"           # git-flow branches carry teammate handles and codenames
+        table = {"/user": (200, {"login": "agent-bot"}, {}), f"/repos/{REPO}": repo({"admin": False, "push": True}, "repo"),
+                 f"/repos/{REPO}/branches/{q}": (200, {"protected": False}, {}), f"/repos/{REPO}/rules/branches/{q}": (200, [], {})}
+        _, rep, files = run(table, True, ["--branch", b, "--anonymize"])
+        text = json.dumps(rep) + "".join(files.values())
+        for leak in ("alice", "project-phoenix"):                           # neither the raw nor the url-quoted branch may survive
+            self.assertNotIn(leak, text)
+        self.assertIn("<branch>", json.dumps(rep))
+
     def test_the_page_escapes_what_it_shows(self):
         page = A.page({"repository": "<script>x</script>", "branch": "main", "verdict": "v", "credential": "c", "generated_at": "t", "protects": ["<b>"],
                        "findings": [], "cannot_determine": [], "limits": "l", "evidence": []})
         self.assertNotIn("<script>x", page)
+
+
+class PassportStarter(unittest.TestCase):
+    """The bridge from the check's finding to the Change Passport fix: a tailored policy that parses cleanly."""
+
+    def test_starter_is_tailored_to_the_branch(self):
+        # standard-library only, like the rest of the public check: assert on the emitted text, no YAML parser needed
+        text = A.passport_starter({"repo": "acme/app", "branch": "release/it's"})
+        self.assertIn("# Haven Change Passport starter for acme/app (branch release/it's)", text)
+        self.assertIn("target_branches: ['release/it''s']", text)   # apostrophe doubled: valid YAML
+        self.assertIn("scope: all_changes", text)                   # every change needs an approval: closes the no-review gap
+        self.assertIn("  - 'secrets/**'", text)
+        self.assertEqual(text.count("authority: A3"), 4)            # four agents, none above A3 (no agent merges on its own)
+        for name in ("Claude Code", "Devin", "Cursor", "Codex"):
+            self.assertIn(f"name: {name}", text)
+
+    def test_main_emits_the_starter_next_to_the_report(self):
+        table = {"/repos/acme/app": (200, {"default_branch": "main", "private": False, "permissions": {}}, {}),
+                 "/repos/acme/app/branches/main": (200, {"protected": False, "protection": {"enabled": False}}, {}),
+                 "/repos/acme/app/rules/branches/main": (200, [], {})}
+        with tempfile.TemporaryDirectory() as tmp:
+            out, pp = Path(tmp) / "rep", Path(tmp) / "passport.yaml"
+            A.main(["--repo", REPO, "--out", str(out), "--emit-passport", str(pp)], t=Fake(table))
+            self.assertTrue(pp.exists() and "target_branches" in pp.read_text())
+
+
+class RepositoryLevelRulesetIsStillUnprotected(unittest.TestCase):
+    """Regression: a branch with protected=false but a ruleset of only repository_* rules (visibility/delete/transfer) is NOT protected —
+    those rules govern the repository, not pushes to the branch. The check must still flag HIGH, not report 'no gap'."""
+
+    def test_repo_level_only_ruleset_flags_high(self):
+        b = "main"
+        table = {
+            "/user": (200, {"login": "tester"}, {}),
+            f"/repos/{REPO}": (200, {"default_branch": b, "private": False, "permissions": {"admin": False, "push": False, "pull": True}}, {}),
+            f"/repos/{REPO}/branches/{b}": (200, {"protected": False, "protection": {"enabled": False}}, {}),
+            f"/repos/{REPO}/branches/{b}/protection": (404, {"message": "Branch not protected"}, {}),
+            f"/repos/{REPO}/rules/branches/{b}": (200, [{"type": "repository_visibility"}, {"type": "repository_delete"}, {"type": "repository_transfer"}], {}),
+        }
+        F, _ = A.findings(A.collect(Fake(table), REPO))
+        hi = [f for f in F if f["severity"] == "HIGH" and f["id"] == "branch-unprotected"]
+        self.assertTrue(hi, "a repository-level-only ruleset must still flag the branch as unprotected")
+        self.assertIn("repository-level ruleset", hi[0]["detail"])        # and must not claim 'no ruleset'
+        self.assertNotIn("repository_visibility", {x for f in F for x in [f["id"]]})  # repo-level types are not treated as branch protection
+
+
+class AutomatedGateIsNotHumanReview(unittest.TestCase):
+    """Regression: a branch whose ruleset requires only an automated gate (status checks, merge queue, deployments) or a push restriction,
+    with no pull_request rule, is NOT review-gated. An agent whose change passes the automated rules merges with no human approval, so the
+    check must flag MEDIUM 'no-review-required' — not report 'no gap'. A pull_request rule, or a truly empty ruleset, keeps its old behaviour."""
+
+    def _run(self, rules, protected=True):
+        b = "main"
+        table = {
+            "/user": (200, {"login": "agent-bot"}, {}),
+            f"/repos/{REPO}": (200, {"default_branch": b, "private": False, "permissions": {"admin": False, "push": True, "pull": True}}, {}),
+            f"/repos/{REPO}/branches/{b}": (200, {"protected": protected, "protection": {"enabled": False}}, {}),
+            f"/repos/{REPO}/branches/{b}/protection": (404, {"message": "Branch not protected"}, {}),
+            f"/repos/{REPO}/rules/branches/{b}": (200, rules, {}),
+        }
+        return A.findings(A.collect(Fake(table), REPO))[0]
+
+    def test_status_checks_only_flags_no_review_required(self):
+        F = self._run([{"type": "required_status_checks"}, {"type": "non_fast_forward"}])
+        m = [f for f in F if f["id"] == "no-review-required"]
+        self.assertTrue(m, "a status-check-only branch requires no human review and must be flagged")
+        self.assertEqual(m[0]["severity"], "MEDIUM")
+        self.assertIn("no human review", m[0]["detail"])
+        self.assertNotIn("no-pull-request-required", {f["id"] for f in F})  # the HIGH is only for a branch with no gate at all
+
+    def test_merge_queue_and_update_also_flag(self):
+        for rules in ([{"type": "merge_queue"}], [{"type": "update"}], [{"type": "required_deployments"}]):
+            self.assertIn("no-review-required", {f["id"] for f in self._run(rules)}, rules)
+
+    def test_a_pull_request_rule_is_not_flagged_here(self):
+        F = self._run([{"type": "pull_request", "parameters": {"required_approving_review_count": 1, "require_code_owner_review": True,
+                                                               "dismiss_stale_reviews_on_push": True, "require_last_push_approval": True}}])
+        self.assertNotIn("no-review-required", {f["id"] for f in F})  # a pull_request rule can require review; this finding must not fire
+
+    def test_empty_ruleset_still_flags_high_not_medium(self):
+        F = self._run([{"type": "non_fast_forward"}, {"type": "deletion"}])
+        ids = {f["id"] for f in F}
+        self.assertIn("no-pull-request-required", ids)   # nothing gates a push -> still the HIGH
+        self.assertNotIn("no-review-required", ids)      # and not the MEDIUM
+
+
+class ClassicProtectionWithoutReview(unittest.TestCase):
+    """Regression (D1): classic branch protection that requires status checks but no pull-request review must be
+    flagged as requiring no human review - the classic-path parallel to the ruleset 'no-review-required'."""
+
+    def _ids(self, table):
+        F, _ = A.findings(A.collect(Fake(table), REPO))
+        return {f["id"]: f for f in F}
+
+    def test_classic_checks_without_review_flags_no_review(self):
+        b = "main"
+        ids = self._ids({
+            "/user": (200, {"login": "admin"}, {}),
+            f"/repos/{REPO}": (200, {"default_branch": b, "private": False, "permissions": {"admin": True, "push": True, "pull": True}}, {}),
+            f"/repos/{REPO}/branches/{b}": (200, {"protected": True, "protection": {"enabled": True}}, {}),
+            f"/repos/{REPO}/branches/{b}/protection": (200, {"required_status_checks": {"strict": True, "contexts": ["ci"]},
+                                                             "enforce_admins": {"enabled": True}, "allow_force_pushes": {"enabled": False}}, {}),
+            f"/repos/{REPO}/rules/branches/{b}": (200, [], {}),
+        })
+        self.assertIn("no-review-required-classic", ids)
+        self.assertEqual(ids["no-review-required-classic"]["severity"], "MEDIUM")
+        self.assertIn("does not require a pull-request review", ids["no-review-required-classic"]["detail"])
+
+    def test_classic_with_required_review_is_not_flagged(self):
+        b = "main"
+        ids = self._ids({
+            "/user": (200, {"login": "admin"}, {}),
+            f"/repos/{REPO}": (200, {"default_branch": b, "private": False, "permissions": {"admin": True, "push": True, "pull": True}}, {}),
+            f"/repos/{REPO}/branches/{b}": (200, {"protected": True, "protection": {"enabled": True}}, {}),
+            f"/repos/{REPO}/branches/{b}/protection": (200, {"required_pull_request_reviews": {"required_approving_review_count": 1, "dismiss_stale_reviews": True},
+                                                             "required_status_checks": {"strict": True}, "enforce_admins": {"enabled": True}, "allow_force_pushes": {"enabled": False}}, {}),
+            f"/repos/{REPO}/rules/branches/{b}": (200, [], {}),
+        })
+        self.assertNotIn("no-review-required-classic", ids)
+
+
+class ForcePushAllowedOnRulesetPath(unittest.TestCase):
+    """Regression (D2, Treatment arm). A ruleset-protected branch lacking `non_fast_forward` allows force-pushes and
+    must be flagged. Includes the verifier's false-positive case: classic protection enabled-but-unreadable must NOT fire."""
+
+    def _ids(self, rules, branch_body, protection=(404, {"message": "nf"})):
+        b = "main"
+        table = {
+            "/user": (200, {"login": "agent"}, {}),
+            f"/repos/{REPO}": (200, {"default_branch": b, "private": False, "permissions": {"admin": False, "push": True, "pull": True}}, {}),
+            f"/repos/{REPO}/branches/{b}": (200, branch_body, {}),
+            f"/repos/{REPO}/branches/{b}/protection": (protection[0], protection[1], {}),
+            f"/repos/{REPO}/rules/branches/{b}": (200, rules, {}),
+        }
+        F, _ = A.findings(A.collect(Fake(table), REPO))
+        return {f["id"] for f in F}
+
+    REVIEWED = [{"type": "pull_request", "parameters": {"required_approving_review_count": 1, "require_code_owner_review": True,
+                                                        "dismiss_stale_reviews_on_push": True, "require_last_push_approval": True}}]
+
+    def test_ruleset_without_non_fast_forward_flags(self):
+        ids = self._ids(self.REVIEWED, {"protected": True, "protection": {"enabled": False}})
+        self.assertIn("force-push-allowed-ruleset", ids)
+
+    def test_ruleset_with_non_fast_forward_not_flagged(self):
+        ids = self._ids(self.REVIEWED + [{"type": "non_fast_forward"}], {"protected": True, "protection": {"enabled": False}})
+        self.assertNotIn("force-push-allowed-ruleset", ids)
+
+    def test_classic_enabled_but_unreadable_does_not_false_positive(self):
+        # classic protection enabled (classic_enabled True) but unreadable (protection 404) -> must NOT fire (verifier's catch)
+        ids = self._ids(self.REVIEWED, {"protected": True, "protection": {"enabled": True}})
+        self.assertNotIn("force-push-allowed-ruleset", ids)
+
+    def test_ruleset_update_rule_suppresses_force_push(self):
+        # an `update` (restrict who may push) rule gates force-pushes too -> no ruleset force-push finding (issue #2)
+        ids = self._ids(self.REVIEWED + [{"type": "update"}], {"protected": True, "protection": {"enabled": False}})
+        self.assertNotIn("force-push-allowed-ruleset", ids)
+
+    def test_classic_force_push_suppressed_by_ruleset_non_fast_forward(self):
+        # classic allows force-pushes, but a ruleset adds non_fast_forward; GitHub's stricter rule wins -> suppress (issue #5)
+        allow_fp = (200, {"allow_force_pushes": {"enabled": True}, "enforce_admins": {"enabled": True}})
+        fires = self._ids(self.REVIEWED, {"protected": True, "protection": {"enabled": True}}, protection=allow_fp)
+        self.assertIn("force-push-allowed", fires)                    # control: classic force-push fires when nothing overrides it
+        suppressed = self._ids(self.REVIEWED + [{"type": "non_fast_forward"}], {"protected": True, "protection": {"enabled": True}}, protection=allow_fp)
+        self.assertNotIn("force-push-allowed", suppressed)
+
+
+class ClassicReviewBypass(unittest.TestCase):
+    """Regression (pre-publication audit): a classic branch that requires review but lists bypass actors is NOT protected against them.
+    The data is already in the fetched protection payload, so the check must flag HIGH, not report a clean verdict."""
+
+    def _ids(self, rpr):
+        b = "main"
+        table = {
+            "/user": (200, {"login": "agent-bot"}, {}),
+            f"/repos/{REPO}": (200, {"default_branch": b, "private": False, "permissions": {"admin": False, "push": True, "pull": True}}, {}),
+            f"/repos/{REPO}/branches/{b}": (200, {"protected": True, "protection": {"enabled": True}}, {}),
+            f"/repos/{REPO}/branches/{b}/protection": (200, {"required_pull_request_reviews": rpr, "enforce_admins": {"enabled": True},
+                                                             "allow_force_pushes": {"enabled": False}}, {}),
+            f"/repos/{REPO}/rules/branches/{b}": (200, [], {}),
+        }
+        F, _ = A.findings(A.collect(Fake(table), REPO))
+        return {f["id"]: f for f in F}
+
+    REVIEWED = {"required_approving_review_count": 1, "dismiss_stale_reviews": True, "require_last_push_approval": True}
+
+    def test_bypass_actors_flag_high(self):
+        ids = self._ids({**self.REVIEWED, "bypass_pull_request_allowances": {"users": [], "teams": [], "apps": ["automation-app"]}})
+        self.assertIn("review-bypass-allowed", ids)
+        self.assertEqual(ids["review-bypass-allowed"]["severity"], "HIGH")
+        self.assertIn("bypass", ids["review-bypass-allowed"]["detail"].lower())
+
+    def test_no_bypass_actors_not_flagged(self):
+        self.assertNotIn("review-bypass-allowed", self._ids(self.REVIEWED))                                             # no bypass block at all
+        self.assertNotIn("review-bypass-allowed", self._ids({**self.REVIEWED, "bypass_pull_request_allowances": {"users": [], "teams": [], "apps": []}}))  # empty lists
+
+
+class CodeownersGlob(unittest.TestCase):
+    """Regression (audit): _covered must honor mid-path glob patterns, else a glob-scoped CODEOWNERS yields a false governance-files-unowned."""
+
+    def test_mid_path_glob_is_covered(self):
+        self.assertTrue(A._covered("/.github/workflows/*.yml @team\n", ".github/workflows/ci.yml"))
+        self.assertTrue(A._covered(".github/**/*.yml @team\n", ".github/workflows/ci.yml"))
+
+    def test_existing_shapes_unbroken(self):
+        self.assertTrue(A._covered("* @team\n", "anything/here.txt"))
+        self.assertTrue(A._covered("/.github/ @team\n", ".github/workflows/ci.yml"))
+        self.assertTrue(A._covered("*.yml @team\n", ".github/workflows/ci.yml"))
+        self.assertFalse(A._covered("/docs/*.md @team\n", ".github/workflows/ci.yml"))
+
+
+class DiagnosticOffer(unittest.TestCase):
+    """Task 4: an actionable finding routes to the opt-in $1,500 diagnostic; a clean repo carries no offer."""
+
+    def test_offer_present_when_actionable(self):
+        _, rep, files = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": False}, {}),
+                             f"/repos/{REPO}/branches/main/protection": (401, {}, {}),
+                             f"/repos/{REPO}/rules/branches/main": (200, [], {})}, authenticated=False)
+        self.assertGreater(rep["counts"]["HIGH"], 0)
+        for needle in ("Agent Authority Diagnostic", "$1,500", "five business days", "opt-in"):
+            self.assertIn(needle, files["report.md"])
+        self.assertIn("Agent Authority Diagnostic", files["report.html"])
+        self.assertNotIn(A.CONTACT, files["report.md"])                 # the offer stays email-free so the report is still forwardable
+
+    def test_no_offer_when_clean(self):
+        rules = [{"type": "pull_request", "parameters": {"required_approving_review_count": 1, "require_code_owner_review": True,
+                                                         "require_last_push_approval": True, "dismiss_stale_reviews_on_push": True}}, {"type": "non_fast_forward"}]
+        _, rep, files = run({"/user": (200, {"login": "agent-bot"}, {}), f"/repos/{REPO}": repo({"admin": False, "maintain": False, "push": True, "pull": True}, "repo"),
+                             f"/repos/{REPO}/branches/main": (200, {"protected": True}, {}), f"/repos/{REPO}/branches/main/protection": (404, {}, {}),
+                             f"/repos/{REPO}/rules/branches/main": (200, rules, {}),
+                             f"/repos/{REPO}/contents/.github/CODEOWNERS?ref=main": codeowners("* @lead\n/.github/ @lead @sec\n")})
+        self.assertEqual(rep["counts"]["HIGH"] + rep["counts"]["MEDIUM"], 0)
+        self.assertNotIn("Agent Authority Diagnostic", files["report.md"])
 
 
 if __name__ == "__main__":

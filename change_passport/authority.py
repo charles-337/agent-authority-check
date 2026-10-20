@@ -13,6 +13,7 @@ import argparse
 import base64
 import hashlib
 import html
+import fnmatch
 import json
 import os
 import re
@@ -168,12 +169,15 @@ def _covered(text, path):
             continue
         pattern, owners = line.split()[0], line.split()[1:]
         p = pattern.strip("/")
-        if pattern in ("*", "/*", "**") or path == p or path.startswith(p.rstrip("*").rstrip("/") + "/") or (pattern.startswith("*.") and path.endswith(pattern[1:])):
+        if (pattern in ("*", "/*", "**") or path == p or path.startswith(p.rstrip("*").rstrip("/") + "/")
+                or (pattern.startswith("*.") and path.endswith(pattern[1:])) or fnmatch.fnmatch(path, p) or fnmatch.fnmatch(path, p + "/*")):
             owner = owners
     return bool(owner)
 
 
-BLOCKING = {"pull_request", "update", "required_status_checks", "merge_queue", "required_deployments"}
+CHECK_GATE = {"required_status_checks", "merge_queue", "required_deployments"}  # automated gates: each can block a change, but none requires a human review
+PUSH_GATE = {"update"}                                                          # restricts who may push to the branch — a partial gate, still not a review
+BLOCKING = {"pull_request"} | PUSH_GATE | CHECK_GATE                            # any rule type that stands between a commit and the branch
 RULE_WORDS = {"deletion": "block deletion", "non_fast_forward": "block force-pushes", "pull_request": "require a pull request", "update": "restrict who may push",
               "required_status_checks": "require status checks", "required_signatures": "require signed commits", "required_linear_history": "require linear history",
               "merge_queue": "require a merge queue", "required_deployments": "require deployments", "creation": "restrict creation"}
@@ -255,6 +259,7 @@ def findings(d):
     F, repo, br = [], d["repo"], d["branch"]
     qb = urllib.parse.quote(br, safe="")
     prot, rules = d["protection"], d["rules"] or []
+    branch_rules = [x for x in rules if not str(x.get("type") or "").startswith("repository_")]  # repository_* rules govern the repo (visibility, rename, deletion), not pushes to this branch
     pr = [x.get("parameters") or {} for x in rules if x.get("type") == "pull_request"]
     rv = (prot or {}).get("required_pull_request_reviews")
 
@@ -265,24 +270,38 @@ def findings(d):
                   "apply_note": _private(d) if rs else ""})
 
     # 1. Is there anything between an agent's commit and the branch?
-    if d["protected"] is False and not rules:
+    if d["protected"] is False and not branch_rules:
         add("HIGH", "branch-unprotected", f"Nothing stops a direct push to `{br}`.",
-            f"`{br}` has no branch protection and no ruleset. Any credential with write access, including a token you give a coding agent, can push "
-            "straight to it: no pull request, review or check is required." + (f" The repository has a {d['codeowners']['path']} file, but nothing enforces it on `{br}`."
-                                                                              if d["codeowners"]["text"] else ""),
-            [f"{d['branch_rid']}: protected = false", f"{d['rules_rid']}: no rules apply to this branch"],
+            f"`{br}` has no branch protection and " + ("only a repository-level ruleset — it governs repository settings such as visibility, renaming or "
+            "deletion, not pushes to this branch" if rules else "no ruleset") + ". Any credential with write access, including a token you give a coding "
+            "agent, can push straight to it: no pull request, review or check is required." + (f" The repository has a {d['codeowners']['path']} file, but "
+            f"nothing enforces it on `{br}`." if d["codeowners"]["text"] else ""),
+            [f"{d['branch_rid']}: protected = false", f"{d['rules_rid']}: no rule governs pushes to this branch"
+             + (f" (only repository-level rules: {', '.join(sorted({x.get('type') for x in rules}))})" if rules else "")],
             _curl(d, f"/repos/{repo}/branches/{qb}", '"protected"|"enabled"') + "; " + _curl(d, f"/repos/{repo}/rules/branches/{qb}"),
             f"Protect `{br}` (Settings › Rules or Branches): require {REVIEW}; block force-pushes and deletion.",
-            '"protected": false and "enabled": false, then [] (no rules)',
+            '"protected": false and "enabled": false, then no rule whose type governs pushes to this branch',
             (f"Protect {br}", [{"type": "deletion"}, {"type": "non_fast_forward"}, PR_RULE]))
-    if d["protected"] and d["classic_enabled"] is False and rules and not BLOCKING & {x.get("type") for x in rules}:
+    if d["protected"] and d["classic_enabled"] is False and branch_rules and not BLOCKING & {x.get("type") for x in branch_rules}:
         add("HIGH", "no-pull-request-required", f"Nothing requires a pull request before commits land on `{br}`.",
             f"The only rules on `{br}` are: {'; '.join(_protects(d)[1][len('Rulesets: '):].split('; '))}. Classic branch protection is off, so any credential with write "
             "access, including a token you give a coding agent, can push commits straight to it.",
-            [f"{d['branch_rid']}: protected = true, protection.enabled = false", f"{d['rules_rid']}: rule types = {', '.join(sorted({x.get('type') for x in rules}))}"],
+            [f"{d['branch_rid']}: protected = true, protection.enabled = false", f"{d['rules_rid']}: rule types = {', '.join(sorted({x.get('type') for x in branch_rules}))}"],
             _curl(d, f"/repos/{repo}/branches/{qb}", '"protected"|"enabled"') + "; " + _curl(d, f"/repos/{repo}/rules/branches/{qb}", '"type"'),
             f"Add a ruleset rule for `{br}` that requires {REVIEW}.",
             f'"protected": true and "enabled": false, then only the types {", ".join(sorted({x.get("type") for x in rules}))}',
+            (f"Require a pull request on {br}", [PR_RULE]))
+    types = {x.get("type") for x in branch_rules}
+    if d["protected"] and d["classic_enabled"] is False and branch_rules and "pull_request" not in types and (CHECK_GATE | PUSH_GATE) & types:
+        gates = ", ".join(RULE_WORDS.get(t, t) for t in sorted((CHECK_GATE | PUSH_GATE) & types))
+        add("MEDIUM", "no-review-required", f"Changes to `{br}` require no human review.",
+            f"`{br}` has rules that {gates}, but none that requires a pull request or an approving review. Classic branch protection is off, so any "
+            f"identity that satisfies those rules, including a token you give a coding agent, can land commits on `{br}` with no human review.",
+            [f"{d['branch_rid']}: protected = true, protection.enabled = false",
+             f"{d['rules_rid']}: rule types = {', '.join(sorted(types))} (no pull_request rule)"],
+            _curl(d, f"/repos/{repo}/branches/{qb}", '"protected"|"enabled"') + "; " + _curl(d, f"/repos/{repo}/rules/branches/{qb}", '"type"'),
+            f"Add a ruleset rule for `{br}` that requires {REVIEW}.",
+            f'"protected": true and "enabled": false, with rule types {", ".join(sorted(types))} but no pull_request',
             (f"Require a pull request on {br}", [PR_RULE]))
     # 2. Review rules, where they are visible (rulesets are visible to anyone who can read the repository; classic settings need admin to read)
     reviews = [rv.get("required_approving_review_count", 0)] if rv else []
@@ -298,9 +317,39 @@ def findings(d):
             "Neither 'dismiss stale approvals' nor 'require approval of the most recent push' is on, so a change can be altered after a person approved it.",
             [f"{d['protection_rid'] if rv else d['rules_rid']}: stale-approval dismissal off, most-recent-push approval off"],
             _curl(d, f"/repos/{repo}/rules/branches/{qb}"), "Turn on 'Require approval of the most recent reviewable push'.")
-    if prot and (prot.get("allow_force_pushes") or {}).get("enabled"):
+    bp = (rv or {}).get("bypass_pull_request_allowances") or {}
+    bypass_actors = (bp.get("users") or []) + (bp.get("teams") or []) + (bp.get("apps") or [])
+    if rv and bypass_actors:
+        add("HIGH", "review-bypass-allowed", f"Listed actors can bypass the required review on `{br}`.",
+            f"`{br}` requires a pull-request review, but {len(bypass_actors)} actor(s) are allowed to bypass it (an "
+            "'allow specified actors to bypass required pull requests' list of users, teams or apps). Any of them — often an automation "
+            "app or a machine account a coding agent uses — can merge into the branch with no approval, so the branch is not as protected "
+            "as its review rule suggests.",
+            [f"{d['protection_rid']}: required_pull_request_reviews.bypass_pull_request_allowances names {len(bypass_actors)} actor(s)"],
+            _curl(d, f"/repos/{repo}/branches/{qb}/protection", '"bypass_pull_request_allowances"', auth=True),
+            "Remove the bypass actors, or make sure no identity a coding agent can use is among them.")
+    if d["classic_enabled"] and prot is not None and not rv and not pr:
+        reqd = "status checks" if (prot.get("required_status_checks") or {}) else "some non-review controls"
+        add("MEDIUM", "no-review-required-classic", f"Classic protection on `{br}` requires no human review.",
+            f"`{br}` has classic branch protection, but it does not require a pull-request review (it requires {reqd}). "
+            f"Any identity that satisfies those controls, including a token you give a coding agent, can land commits on "
+            f"`{br}` with no human approval.",
+            [f"{d['protection_rid']}: required_pull_request_reviews absent while classic protection is enabled"],
+            _curl(d, f"/repos/{repo}/branches/{qb}/protection", '"required_pull_request_reviews"', auth=True),
+            "Require a pull request with at least one approving review before merging.")
+    rule_types = {r.get("type") for r in branch_rules}
+    # A ruleset `non_fast_forward` overrides classic allow_force_pushes (GitHub applies both; the stricter wins), so
+    # the classic finding must not fire when the ruleset already blocks force-pushes.
+    if prot and (prot.get("allow_force_pushes") or {}).get("enabled") and "non_fast_forward" not in rule_types:
         add("MEDIUM", "force-push-allowed", f"Force-pushes to `{br}` are allowed.", "Its history can be rewritten.",
             [f"{d['protection_rid']}: allow_force_pushes.enabled = true"], _curl(d, f"/repos/{repo}/branches/{qb}/protection", '"allow_force_pushes"', auth=True), "Block force-pushes.")
+    # On the ruleset path, `non_fast_forward` blocks force-pushes and `update` restricts who may push (both gate it).
+    if d["classic_enabled"] is False and branch_rules and not ({"non_fast_forward", "update"} & rule_types):
+        add("MEDIUM", "force-push-allowed-ruleset", f"Force-pushes to `{br}` are allowed.",
+            "A ruleset protects this branch, but nothing blocks force-pushes (no `non_fast_forward`) and nothing restricts who may push, so its history can be rewritten.",
+            [f"{d['rules_rid']}: rule types = {', '.join(sorted(t for t in rule_types if t))}; no non_fast_forward or update; classic protection off"],
+            _curl(d, f"/repos/{repo}/rules/branches/{qb}", '"type"'),
+            "In the ruleset for this branch, enable 'Block force pushes' (a `non_fast_forward` rule).")
     if prot and (prot.get("enforce_admins") or {}).get("enabled") is False:
         add("MEDIUM", "admins-bypass", f"Administrators are not held to `{br}`'s protection.", "'Include administrators' is off.",
             [f"{d['protection_rid']}: enforce_admins.enabled = false"], _curl(d, f"/repos/{repo}/branches/{qb}/protection", '"enforce_admins"', auth=True),
@@ -326,7 +375,7 @@ def findings(d):
                 _curl(d, f"/repos/{repo}", '"admin"', auth=True), AGENT_IDENTITY)
     elif perms:
         add("OK", "credential-cannot-change-protection", "This credential cannot change the repository's protections.",
-            f"{who} has {'write' if perms.get('push') else 'read'} access, without admin or maintain rights.",
+            f"{who} has {'write' if perms.get('push') else 'read'} access, without the admin rights needed to change protection.",
             [f"{d['repo_rid']}: permissions = {json.dumps(perms, sort_keys=True)}"], _curl(d, f"/repos/{repo}", '"admin"|"push"', auth=True), "Nothing to change.")
     # 4. Who owns the files that govern the repository
     co = d["codeowners"]
@@ -353,7 +402,8 @@ def findings(d):
         unknown.append("What any particular credential may do: run with GITHUB_TOKEN set to your agent's token (read access is enough) to see that.")
     elif not d["permissions"]:
         unknown.append("This credential's role: GitHub did not report one (workflow and app tokens get their permissions from the workflow or app settings).")
-    unknown.append("Whether GitHub refuses a change in practice: this check reads settings and never tries one. Ruleset bypass lists are not visible here either.")
+    unknown.append("Whether GitHub refuses a change in practice: this check reads settings and never tries one. A ruleset's bypass list — which actors may skip its "
+                   "pull-request rule — is not returned by GitHub's rules API, so ruleset bypass actors are not visible here (classic bypass allowances, when readable, are reported above).")
     return F, unknown
 
 
@@ -384,6 +434,11 @@ def anonymize(rep, d):
     names = {d["repo"]: "<repository>", d["repo"].split("/")[0]: "<owner>"}
     if d["login"]:
         names.setdefault(d["login"], "<credential-user>")
+    if d.get("branch"):                              # branch names routinely carry teammate handles (user/feature) or internal codenames
+        names.setdefault(d["branch"], "<branch>")
+        qb = urllib.parse.quote(d["branch"], safe="")   # the url-quoted form also appears in the curl commands
+        if qb != d["branch"]:
+            names.setdefault(qb, "<branch>")
     for m in re.findall(r"@([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?)", d["codeowners"]["text"] or ""):
         names.setdefault(m, f"<code-owner-{len(names)}>")
     text = json.dumps(rep, ensure_ascii=False)
@@ -398,14 +453,20 @@ BEYOND = ("This check is free. Haven, which publishes it, also builds a guard fo
           "same, whoever wrote it: one authority rule per agent (what it may merge itself, what needs a person's signed approval of that exact change, "
           "and what it may never touch), a check inside the agent's session that stops a protected action before it runs, and a receipt for every decision.")
 BEYOND_LAST = f"Shown in a sandbox, not yet on GitHub. Details: {GUARD_URL}"
+DIAGNOSTIC_OFFER = ("If you would rather have it mapped for your repository — exactly what your coding agent's credential can do to this branch, whether it "
+                    "could switch the rules off, who can bypass them, the fix, and a re-check under the agent's own read-only token confirming the finding is "
+                    "gone and that token cannot switch the rules off — that is Haven's opt-in Agent Authority Diagnostic: fixed $1,500, five business days "
+                    "after access and scope are agreed, invoiced on delivery.")
 
 
 def _beyond(rep):
-    """The last section: what branch settings cannot do, and the guard. Fixing the findings comes first, because the guard holds only where the
-    agent's own credential cannot switch the branch rules off."""
+    """The last section: what branch settings cannot do, the guard, and — when there is something to fix — the opt-in paid diagnostic.
+    Fixing the findings comes first, because the guard holds only where the agent's own credential cannot switch the branch rules off."""
+    actionable = bool((rep.get("counts") or {}).get("HIGH") or (rep.get("counts") or {}).get("MEDIUM"))
     first = ("Fix the findings above first: the guard does not replace branch rules, and it holds only where the agent's own credential cannot "
-             "switch them off. " if (rep.get("counts") or {}).get("HIGH") or (rep.get("counts") or {}).get("MEDIUM") else "")
-    return first + BEYOND, BEYOND_LAST
+             "switch them off. " if actionable else "")
+    last = (DIAGNOSTIC_OFFER + " " + BEYOND_LAST) if actionable else BEYOND_LAST
+    return first + BEYOND, last
 
 
 def markdown(rep):
@@ -464,6 +525,31 @@ def page(rep):
     return "\n".join(out)
 
 
+def passport_starter(d):
+    """A Change Passport policy tailored to this repository, so the check's finding flows straight into the fix. Every change into the
+    assessed branch needs an approval, the common coding agents are recognised at A3 (may prepare on their own branch, never merge on their
+    own), the governance paths need two approvers, and secrets are refused outright. The reader sets a real approver and runs
+    `change-passport init`. It is a fixed template written as plain text, so the check stays standard-library only; it parses under
+    policy.parse and any YAML reader."""
+    q = lambda s: "'" + str(s).replace("'", "''") + "'"       # single-quoted YAML scalar, apostrophes doubled
+    return (f"# Haven Change Passport starter for {d['repo']} (branch {d['branch']}), generated by agent-authority-check.\n"
+            f"# It closes the gap this check reports: every change into {d['branch']} needs an approval, and no agent merges on its own.\n"
+            "# This is a proposed policy template. To enforce it, set up the Haven Change Passport guard - see the 'Beyond branch settings' section of the README.\n"
+            "\nversion: 1\n"
+            f"target_branches: [{q(d['branch'])}]\n"
+            "agents:\n"
+            "  - name: Claude Code\n    trailers: ['Co-Authored-By: Claude']\n    branch_prefixes: ['claude/']\n    authority: A3\n"
+            "  - name: Devin\n    branch_prefixes: ['devin/']\n    authority: A3\n"
+            "  - name: Cursor\n    branch_prefixes: ['cursor/']\n    authority: A3\n"
+            "  - name: Codex\n    branch_prefixes: ['codex/']\n    authority: A3\n"
+            "scope: all_changes\n"
+            "approvers: [repository-owner]\n"
+            "second_approval_paths:\n  - '.haven/**'\n  - '.github/**'\n"
+            "refuse_paths:\n  - 'secrets/**'\n"
+            "autonomous_paths: []\n"
+            "test_command: null\n")
+
+
 def main(argv=None, t=None):
     ap = argparse.ArgumentParser(prog="agent-authority-check", description="Read-only: what stands between an AI agent and this repository's main branch?")
     ap.add_argument("--repo", required=True, help="OWNER/NAME")
@@ -472,6 +558,7 @@ def main(argv=None, t=None):
     ap.add_argument("--json", help="also write the report as JSON to this file")
     ap.add_argument("--anonymous", action="store_true", help="use no credential: check a public repository as the public sees it")
     ap.add_argument("--anonymize", action="store_true", help="replace repository, owner and user names with placeholders before sharing")
+    ap.add_argument("--emit-passport", dest="emit_passport", metavar="PATH", help="also write a Change Passport policy starter tailored to this repository (feeds change-passport init)")
     ap.add_argument("--summary", action="store_true", help="inside GitHub Actions: add the report to the run summary")
     ap.add_argument("--fail-on-high", action="store_true", help="exit 1 when a HIGH finding exists (for CI)")
     a = ap.parse_args(argv)
@@ -487,6 +574,8 @@ def main(argv=None, t=None):
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.md").write_text(markdown(rep), encoding="utf-8")
     (out / "report.html").write_text(page(rep), encoding="utf-8")
+    if a.emit_passport:
+        Path(a.emit_passport).write_text(passport_starter(d), encoding="utf-8")
     if a.json:
         Path(a.json).write_text(json.dumps(rep, indent=1, ensure_ascii=False), encoding="utf-8")
     if a.summary and os.environ.get("GITHUB_STEP_SUMMARY"):

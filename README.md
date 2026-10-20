@@ -14,6 +14,7 @@ You need Python 3.10 or later.
 ```bash
 pip install git+https://github.com/charles-337/agent-authority-check@v1
 agent-authority-check --repo OWNER/NAME
+agent-authority-check --repo OWNER/NAME --emit-passport passport.yaml   # also writes a ready Change Passport policy that closes the gap
 open agent-authority-OWNER-NAME-main/report.html   # one folder per repository and branch; report.md is the same report as text
 ```
 
@@ -89,6 +90,10 @@ The report appears in the run's summary. The check uses only Python's standard l
   - no force-push and no deletion.
 
   You run it as a repository admin; the check itself never writes. If you work alone, nobody else can approve your pull requests, so the report prints a second command to use instead. It lets repository admins merge a pull request without another approval, and nothing more: no one may push directly, and anyone without admin rights, an agent included, still needs someone else's approval.
+- **The whole policy, not just one ruleset:** add `--emit-passport passport.yaml` and the check writes a ready Change Passport policy for this repository — every change needs an approval, no agent (A3) merges on its own, secrets are refused. Three states stay distinct:
+  1. **Proposed:** the policy the check emits. A template until it is enforced.
+  2. **Enforced locally, shown:** that generated policy, installed in an isolated sandbox, refused an unauthorized agent change, accepted an approval of the exact change, and refused an alteration made after approval (see below).
+  3. **Enforced on GitHub, not yet shown:** making the check the branch's required status check, on a repository you host. That is the production control — designed, not yet tested here.
 - **The credential can switch protection off:** no command can fix this for you. Give the agent its own identity with write access only, either a machine account or a GitHub App, and give the agent only that identity's token. Then run the check again with that token.
 - After each fix, run the check again. The finding you fixed should be gone.
 
@@ -106,6 +111,8 @@ Branch rules decide what may land on a branch. They treat every pull request the
 - the same commit, pushed separately with the hook out of the way, was refused by that repository's own check;
 - its attempt to edit the guard's settings was refused.
 
+The policy this check emits with `--emit-passport` was itself put under that enforcement, in a separate sandbox run: an unauthorized agent change was refused, an approval of the exact change was accepted, and a change altered after approval was refused — the generated fix, proven to hold, not just proposed.
+
 **Not yet shown: enforcement on GitHub itself.**
 - On GitHub, letting an agent merge routine changes without a person means replacing the approval rule above with a required check that only Haven can report. That is designed, not yet tested.
 - Until then, the fixes above require a person's approval for every agent change.
@@ -113,5 +120,8 @@ Branch rules decide what may land on a branch. They treat every pull request the
 
 The guard isn't published. Haven sets it up for one agent workflow against a copy of your setup, then reports what it allowed, held and refused, with evidence you can check yourself.
 
-- Questions, problems or ideas: open an issue at https://github.com/charles-337/agent-authority-check/issues.
-- The guard: charles_337@me.com
+**The Agent Authority Diagnostic.** If you would rather have this mapped and proven for one repository, rather than run the free check yourself, that is Haven's opt-in diagnostic: a written report for one repository and branch that shows exactly what your coding agent's credential can do to the branch, whether it could switch the rules off, who can bypass them, and the fix — every finding backed by a request you can repeat yourself, and the fix re-checked under the agent's own read-only token to confirm the finding no longer appears and that the token cannot switch the protection off. **$1,500, five business days after access and scope are agreed, invoiced on delivery.** It is opt-in: nothing is collected or charged unless you ask for it.
+
+- The two paid engagements in full — the $1,500 Agent Authority Diagnostic and the separate $1,000 economic-outcome pilot: [`commercial/START_HERE.md`](commercial/START_HERE.md).
+- Ask about a diagnostic: [open a sanitized request](../../issues/new?template=authority-diagnostic.yml) (no secrets, no private details), or email charles_337@me.com.
+- Questions, problems, ideas, or the guard: open an [issue](https://github.com/charles-337/agent-authority-check/issues), or email charles_337@me.com.
