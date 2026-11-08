@@ -90,11 +90,13 @@ class Findings(unittest.TestCase):
         self.assertTrue(any("only repository admins can read them" in u for u in rep["cannot_determine"]))
 
     def test_rulesets_with_no_approval_and_approvals_that_survive_new_commits(self):
+        # classic protection must be known off for these to be facts: hidden classic settings could require an approval (UnreadableRules)
+        off = (200, {"protected": True, "protection": {"enabled": False}}, {})
         none = [{"type": "pull_request", "parameters": {"required_approving_review_count": 0, "require_code_owner_review": False}}]
-        _, rep, _ = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": True}, {}), f"/repos/{REPO}/rules/branches/main": (200, none, {})}, False)
+        _, rep, _ = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": off, f"/repos/{REPO}/rules/branches/main": (200, none, {})}, False)
         self.assertIn("no-approval-required", [f["id"] for f in rep["findings"]])
         stale = [{"type": "pull_request", "parameters": {"required_approving_review_count": 2}}]
-        _, rep, _ = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": True}, {}), f"/repos/{REPO}/rules/branches/main": (200, stale, {})}, False)
+        _, rep, _ = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": off, f"/repos/{REPO}/rules/branches/main": (200, stale, {})}, False)
         self.assertIn("approval-survives-new-commits", [f["id"] for f in rep["findings"]])
 
     def test_protected_only_by_rulesets_that_require_nothing_before_commits_land(self):
@@ -108,7 +110,9 @@ class Findings(unittest.TestCase):
         self.assertFalse(any("classic branch-protection settings" in u for u in rep["cannot_determine"]))   # off is known, not hidden
 
     def test_checks_anyone_can_run_and_a_report_worth_forwarding(self):
-        _, rep, files = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": False}, {})}, authenticated=False)
+        _, rep, files = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": False}, {}),
+                             f"/repos/{REPO}/rules/branches/main": (200, [], {})}, authenticated=False)
+        self.assertIn("branch-unprotected", [f["id"] for f in rep["findings"]])
         for f in rep["findings"]:
             self.assertTrue(f["verify"].startswith('curl -s'), f["verify"])
             self.assertIn('"https://', f["verify"])                                              # quoted: safe in zsh
@@ -118,7 +122,9 @@ class Findings(unittest.TestCase):
             self.assertNotIn("sha256", files[name])                                               # no evidence a reader cannot check
 
     def test_fail_on_high_for_ci(self):
-        code, _, _ = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": False}, {})}, False, ["--fail-on-high"])
+        # a confirmed HIGH needs the rules read: before evidence framing this table had no rules endpoint, and its 404 was read as "no rules"
+        code, _, _ = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": False}, {}),
+                          f"/repos/{REPO}/rules/branches/main": (200, [], {})}, False, ["--fail-on-high"])
         self.assertEqual(code, 1)
 
 
@@ -239,6 +245,210 @@ class Failures(unittest.TestCase):
         with mock.patch("sys.stderr"):
             self.assertEqual(A.main(["--repo", "acme/app/../../x", "--out", tempfile.mkdtemp()], t=t), 2)
         self.assertEqual(t.calls, [])
+
+    def test_a_failed_branch_read_stops_the_check(self):
+        with mock.patch("sys.stderr") as err:
+            code, rep, files = run({f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (502, {"message": "Bad Gateway"}, {})}, False)
+        self.assertEqual(code, 2)
+        self.assertEqual(files, {})                                                              # no report built on a branch it could not read
+        self.assertIn("HTTP 502", "".join(c.args[0] for c in err.write.call_args_list))
+
+
+class Flaky(Fake):
+    """A Fake whose listed endpoints never answer, as a dropped connection would."""
+
+    def __init__(self, table, down, authenticated=True):
+        super().__init__(table, authenticated)
+        self.down = down
+
+    def get(self, path):
+        if path in self.down:
+            self.calls.append(path)
+            raise A.CheckError("cannot reach GitHub: timed out")
+        return super().get(path)
+
+
+def frames(rep):
+    return {f["id"]: f for f in rep["frames"]}
+
+
+RULES = f"/repos/{REPO}/rules/branches/main"
+RULESET_ONLY = {f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": True, "protection": {"enabled": False}}, {})}
+UNPROTECTED_FLAG = {f"/repos/{REPO}": repo(), f"/repos/{REPO}/branches/main": (200, {"protected": False}, {})}
+
+
+class EvidenceFraming(unittest.TestCase):
+    """A limitation of observation is never a fact about the repository: a read that failed is unknown, not empty (evidence_frame)."""
+
+    def test_regression_the_original_false_certainty_cannot_return(self):
+        """Before evidence framing, a failed rules read became `[]`: 'Rulesets: none apply', and a HIGH citing the failed request as proof."""
+        _, rep, files = run({**UNPROTECTED_FLAG, RULES: (503, {"message": "Service Unavailable"}, {})}, False)
+        everything = json.dumps(rep) + files["report.md"] + files["report.html"]
+        self.assertNotIn("none apply", everything)
+        self.assertNotIn("no rule governs pushes", everything)
+        self.assertNotIn("branch-unprotected", [f["id"] for f in rep["findings"]])
+        self.assertEqual(rep["counts"]["HIGH"], 0)
+
+    def test_a_private_repository_on_a_plan_without_rules_says_so_and_does_not_advise_reading_again(self):
+        """Seen live on 2026-11-07 (charles-337/haven-authority-baseline, private): GitHub answers the rules read with a plan message, not a permission one."""
+        plan = (403, {"message": "Upgrade to GitHub Pro or make this repository public to enable this feature.", "status": "403"}, {})
+        _, rep, files = run({**UNPROTECTED_FLAG, RULES: plan}, False)
+        f = frames(rep)["rulesets"]
+        self.assertEqual((f["state"], f["reason"], f["observed_value"]), ("UNKNOWN", "PLAN_LIMITED", None))     # still unknown, never "none apply"
+        said = " ".join(rep["cannot_determine"])
+        self.assertIn("needs GitHub Pro or a public repository", said)
+        self.assertNotIn("Run the check again", said)
+        self.assertNotIn("none apply", json.dumps(rep) + files["report.md"])
+        _, plain, _ = run({**UNPROTECTED_FLAG, RULES: (403, {"message": "Resource not accessible by integration"}, {})}, False)
+        self.assertEqual(frames(plain)["rulesets"]["reason"], "PERMISSION_DENIED")                            # an ordinary refusal is unchanged
+
+    def test_a_failed_rules_read_has_no_empty_rules_representation(self):
+        d = A.collect(Fake({**RULESET_ONLY, RULES: (503, {}, {})}, False), REPO)
+        with self.assertRaises(A.EF.Unread):
+            d["obs"]["rules"].value                                                               # no [] to fall back on
+        rep = A.build(d)
+        f = frames(rep)["rulesets"]
+        self.assertEqual((f["state"], f["observation_status"], f["reason"], f["observed_value"]), ("UNKNOWN", "FAILED", "SOURCE_UNAVAILABLE", None))
+        self.assertIn("Rulesets: unknown (SOURCE_UNAVAILABLE: GitHub answered HTTP 503)", rep["protects"])
+        ok = frames(A.build(A.collect(Fake({**RULESET_ONLY, RULES: (200, [], {})}, False), REPO)))["rulesets"]
+        self.assertEqual((ok["state"], ok["observation_status"], ok["observed_value"]), ("KNOWN_FALSE", "COMPLETE", []))   # a real empty list
+
+    def test_unknown_rulesets_never_give_a_no_gap_verdict(self):
+        _, rep, _ = run({**RULESET_ONLY, RULES: (503, {}, {})}, False)
+        self.assertNotIn("No gap", rep["verdict"])
+        self.assertNotIn("No authority gap", rep["verdict"])
+        self.assertIn("cannot be determined here", rep["verdict"])
+        self.assertEqual([f for f in rep["findings"] if f["severity"] in ("HIGH", "MEDIUM")], [])
+
+    def test_protected_false_with_unread_rules_reports_only_the_narrower_fact(self):
+        code, rep, _ = run({**UNPROTECTED_FLAG, RULES: (500, {}, {})}, False, ["--fail-on-high"])
+        fr = frames(rep)
+        self.assertEqual(fr["branch-protected-flag"]["state"], "KNOWN_FALSE")                    # what GitHub returned, and only that
+        self.assertIn("not a list of them", fr["branch-protected-flag"]["does_not_permit"])
+        held = fr["branch-unprotected"]
+        self.assertEqual((held["state"], held["reason"], held["severity_if_confirmed"]), ("UNKNOWN", "SOURCE_UNAVAILABLE", "HIGH"))
+        self.assertEqual(rep["counts"]["HIGH"], 0)                                                # unknown is not a HIGH ...
+        self.assertTrue(rep["verdict"].startswith("Whether anything stops a direct push to `main` cannot be determined here (SOURCE_UNAVAILABLE"))
+        self.assertEqual(code, 3)                                                                 # ... and not a pass either
+        self.assertEqual(run({**UNPROTECTED_FLAG, RULES: (500, {}, {})}, False)[0], 0)           # without --fail-on-high nothing fails
+
+    def test_http_failures_keep_their_reason(self):
+        cases = {"permission": ((403, {"message": "Resource not accessible"}, {}), "PERMISSION_DENIED"),
+                 "rate limit": ((403, {"message": "API rate limit exceeded"}, {"x-ratelimit-remaining": "0"}), "RATE_LIMITED"),
+                 "secondary limit": ((403, {"message": "You have exceeded a secondary rate limit"}, {"retry-after": "60"}), "RATE_LIMITED"),
+                 "too many": ((429, {}, {}), "RATE_LIMITED"), "server": ((502, {}, {}), "SOURCE_UNAVAILABLE"), "not found": ((404, {}, {}), "NOT_OBSERVED"),
+                 "wrong shape": ((200, {"not": "a list"}, {}), "SOURCE_UNAVAILABLE")}
+        for name, (answer, reason) in cases.items():
+            with self.subTest(name):
+                f = frames(A.build(A.collect(Fake({**RULESET_ONLY, RULES: answer}, False), REPO)))["rulesets"]
+                self.assertEqual((f["state"], f["observation_status"], f["reason"]), ("UNKNOWN", "FAILED", reason))
+        f = frames(A.build(A.collect(Flaky(RULESET_ONLY, {RULES}, False), REPO)))["rulesets"]
+        self.assertEqual((f["reason"], f["limitation"]), ("SOURCE_UNAVAILABLE", "no response"))  # a dropped connection, not an empty list
+
+    def test_a_paginated_rules_read_cannot_establish_absence(self):
+        seen = [{"type": "deletion"}, {"type": "non_fast_forward"}]
+        _, whole, _ = run({**RULESET_ONLY, RULES: (200, seen, {})}, False)
+        self.assertIn("no-pull-request-required", [f["id"] for f in whole["findings"]])           # every rule read: the gap is real
+        more = {"link": f'<https://api.github.com/repositories/1/rules/branches/main?page=2>; rel="next"'}
+        _, part, _ = run({**RULESET_ONLY, RULES: (200, seen, more)}, False)
+        self.assertNotIn("no-pull-request-required", [f["id"] for f in part["findings"]])         # page 2 may hold the pull-request rule
+        fr = frames(part)
+        self.assertEqual((fr["rulesets"]["state"], fr["rulesets"]["observation_status"]), ("KNOWN_TRUE", "PARTIAL"))   # what was seen still counts
+        self.assertEqual((fr["no-pull-request-required"]["state"], fr["no-pull-request-required"]["reason"]), ("UNKNOWN", "PARTIAL_SCOPE"))
+        self.assertTrue(any("more not read" in p for p in part["protects"]))
+
+    def test_classic_findings_a_ruleset_could_override_hold_back_until_the_rules_are_read(self):
+        prot = {"allow_force_pushes": {"enabled": True}, "enforce_admins": {"enabled": True}, "required_status_checks": {"strict": True, "contexts": ["ci"]}}
+        table = {"/user": (200, {"login": "agent-bot"}, {}), f"/repos/{REPO}": repo({"admin": False, "push": True}, "repo"),
+                 f"/repos/{REPO}/branches/main": (200, {"protected": True, "protection": {"enabled": True}}, {}),
+                 f"/repos/{REPO}/branches/main/protection": (200, prot, {})}
+        held = {"force-push-allowed", "no-review-required-classic"}
+        _, read, _ = run({**table, RULES: (200, [], {})})
+        self.assertEqual(held & {f["id"] for f in read["findings"]}, held)                        # with the rules read: both are real
+        _, unread, _ = run({**table, RULES: (503, {}, {})})
+        self.assertEqual(held & {f["id"] for f in unread["findings"]}, set())                     # unread: a ruleset could block force-pushes or require review
+        self.assertEqual({k for k, f in frames(unread).items() if f["state"] == "UNKNOWN"} & held, held)
+        self.assertTrue(any("GitHub answered HTTP 503" in u for u in unread["cannot_determine"]))
+
+    def test_a_codeowners_read_that_failed_is_not_a_missing_file(self):
+        denied = {f"/repos/{REPO}/contents/{p}?ref=main": (403, {}, {}) for p in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")}
+        _, rep, _ = run({**UNPROTECTED, **denied}, False)
+        self.assertNotIn("no-codeowners", [f["id"] for f in rep["findings"]])
+        self.assertEqual((frames(rep)["codeowners"]["state"], frames(rep)["codeowners"]["reason"]), ("UNKNOWN", "PERMISSION_DENIED"))
+        _, rep, _ = run(UNPROTECTED, False)                                                       # three 404s: the file is known absent
+        self.assertIn("no-codeowners", [f["id"] for f in rep["findings"]])
+        self.assertEqual(frames(rep)["codeowners"]["state"], "KNOWN_FALSE")
+
+    def test_a_role_is_not_a_capability(self):
+        base = {f"/repos/{REPO}/branches/main": (200, {"protected": True}, {}), RULES: (200, [], {}), "/user": (200, {"login": "agent-bot"}, {})}
+        cases = {"admin, classic repo scope": (repo({"admin": True, "push": True}, "repo"), True, "KNOWN_TRUE", None),
+                 "admin, fine-grained token": (repo({"admin": True, "push": True}), True, "UNKNOWN", "UNSUPPORTED_INFERENCE"),
+                 "write only": (repo({"admin": False, "push": True}, "repo"), True, "KNOWN_FALSE", None),
+                 "no credential": (repo(), False, "UNKNOWN", "NOT_OBSERVED")}
+        for name, (r, auth, state, reason) in cases.items():
+            with self.subTest(name):
+                f = frames(run({**base, f"/repos/{REPO}": r}, auth)[1])["credential-can-change-protection"]
+                self.assertEqual((f["state"], f["reason"]), (state, reason))
+
+    def test_every_output_carries_the_same_epistemic_state(self):
+        table = {**UNPROTECTED_FLAG, RULES: (503, {}, {})}
+        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            A.main(["--repo", REPO, "--out", d, "--json", f"{d}/r.json"], t=Fake(table, False))
+            rep, md, page = json.loads(Path(d, "r.json").read_text()), Path(d, "report.md").read_text(), Path(d, "report.html").read_text()
+        held = frames(rep)["branch-unprotected"]
+        self.assertEqual((held["state"], held["reason"]), ("UNKNOWN", "SOURCE_UNAVAILABLE"))
+        for text in (md, page):
+            self.assertIn("What is known and what is not", text)
+            self.assertIn("SOURCE_UNAVAILABLE", text)
+            self.assertIn("would be HIGH if confirmed", text)
+        self.assertIn("Nothing stops a direct push to `main`. (would be HIGH if confirmed)", md)
+        self.assertIn("Nothing stops a direct push to <code>main</code>. (would be HIGH if confirmed)", page)
+        self.assertIn(f"{rep['unresolved']} unresolved", out.getvalue())
+        self.assertIn(rep["verdict"], out.getvalue())
+        self.assertIn(rep["verdict"], md)
+
+    def test_conflicting_classic_observations_never_become_a_confirmed_gap(self):
+        for branch in ({"protected": False}, {"protected": True, "protection": {"enabled": False}}):
+            with self.subTest(branch=branch):
+                table = {**UNPROTECTED_FLAG, RULES: (200, [], {}),
+                         f"/repos/{REPO}/branches/main": (200, branch, {}),
+                         f"/repos/{REPO}/branches/main/protection":
+                         (200, {"required_pull_request_reviews": {"required_approving_review_count": 1,
+                                                                  "dismiss_stale_reviews": True}}, {})}
+                code, rep, files = run(table, False, ["--fail-on-high"])
+                fr = frames(rep)
+                for key in ("classic-protection", "pull-request-required", "review-bypass"):
+                    self.assertEqual((fr[key]["state"], fr[key]["reason"]),
+                                     ("UNKNOWN", "CONFLICTING_OBSERVATIONS"))
+                self.assertNotIn("branch-unprotected", [f["id"] for f in rep["findings"]])
+                self.assertIn("cannot be determined", rep["verdict"])
+                self.assertIn("Classic branch protection: unknown (CONFLICTING_OBSERVATIONS", rep["protects"][0])
+                for output in (files["report.md"], files["report.html"]):
+                    self.assertIn("CONFLICTING_OBSERVATIONS", output)
+                if branch["protected"] is False:
+                    self.assertEqual(code, 3)
+
+    def test_frames_are_stable_for_machines(self):
+        a = run({**RULESET_ONLY, RULES: (503, {}, {})}, False)[1]["frames"]
+        b = run({**RULESET_ONLY, RULES: (503, {}, {})}, False)[1]["frames"]
+        strip = lambda fr: [{k: v for k, v in f.items() if k != "observed_at"} for f in fr]
+        self.assertEqual(strip(a), strip(b))
+        self.assertEqual(list(a[0]), ["id", "claim", "state", "observation_status", "reason", "source", "observed_value", "scope_inspected",
+                                      "observed_at", "evidence", "limitation", "permits", "does_not_permit", "resolve", "severity_if_confirmed"])
+
+    def test_confirmed_findings_and_safe_configurations_are_unchanged(self):
+        _, rep, _ = run(UNPROTECTED, False)                                                       # a confirmed HIGH stays HIGH
+        self.assertEqual(rep["findings"][0]["id"], "branch-unprotected")
+        self.assertEqual(rep["findings"][0]["severity"], "HIGH")
+        self.assertEqual((frames(rep)["rulesets"]["state"], frames(rep)["branch-protected-flag"]["state"]), ("KNOWN_FALSE", "KNOWN_FALSE"))
+        rules = [{"type": "pull_request", "parameters": {"required_approving_review_count": 1, "require_code_owner_review": True,
+                                                         "require_last_push_approval": True, "dismiss_stale_reviews_on_push": True}}, {"type": "non_fast_forward"}]
+        _, safe, _ = run({"/user": (200, {"login": "agent-bot"}, {}), f"/repos/{REPO}": repo({"admin": False, "push": True}, "repo"),
+                          f"/repos/{REPO}/branches/main": (200, {"protected": True}, {}), RULES: (200, rules, {}),
+                          f"/repos/{REPO}/contents/.github/CODEOWNERS?ref=main": codeowners("* @lead\n/.github/ @lead @sec\n")})
+        self.assertEqual(safe["verdict"], "`main` is protected, but its settings are visible only to repository admins. No gap found in what is visible.")
+        self.assertEqual(frames(safe)["pull-request-required"]["state"], "KNOWN_TRUE")
+        self.assertEqual(frames(safe)["review-bypass"]["state"], "UNKNOWN")                      # bypass lists are not readable here, and it says so
 
 
 class Credentials(unittest.TestCase):
