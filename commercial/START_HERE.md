@@ -1,6 +1,4 @@
-# Haven — from an agent finding to a verified outcome
-
-**Two distinct engagements. Do not confuse repository configuration with money recovered.**
+# Haven — from an agent finding to a checked fix
 
 Haven is built around one rule: the agent that acted cannot certify its own success.
 
@@ -32,24 +30,11 @@ For an accountable engineering or security owner with an actionable finding, Hav
 
 **Start:** [Open a sanitized request](../issues/new?template=authority-diagnostic.yml), or send a **private** inquiry to charles_337@me.com with the subject `Haven Authority Diagnostic`. We reply with a private scope and delivery agreement. Posting a GitHub issue is **not** ordering or authorizing work.
 
-## 3. Economic Outcome Verification Pilot — $1,000 contingent fee
-
-**No upfront fee; payable only for a verified, realized, attributable, positive owner net benefit under a signed measurement agreement.**
-
-This is a different service, not an output of the GitHub check. A candidate engagement needs:
-- a specific historical or prospective financial claim; an accountable customer owner;
-- an authenticated, customer-authorized system of record that Haven can independently read or observe, not an agent's screenshot or narration;
-- a baseline and counterfactual agreed and frozen **before** corrective action;
-- evidence of actual receipt/settlement where cash recovery is claimed, plus separate cost evidence;
-- a customer-controlled correction path. Haven does not move money or perform corrections.
-
-The receipt separates **changed ledger balance**, **cash paid/transferred**, **causal confidence**, **all costs**, and **customer net**. It can report `VERIFIED`, `REFUTED`, `INCONCLUSIVE`, `UNOBSERVED` or `DISPUTED`. This is independent verification, not a regulated audit or attestation engagement; Haven is not a licensed audit or attestation service. An unverifiable or nonpositive result costs $0 under the pilot fee term. See [measurement and engagement terms](MEASUREMENT_AND_TERMS.md).
-
-**Start:** email charles_337@me.com with subject `Haven Economic Outcome Pilot` and a **non-sensitive** description of the use case and the system-of-record vendor (e.g. ERP or billing platform). Never email credentials, transaction records or customer personal data in an unsolicited inquiry. Access is designed and authorized after scope agreement.
+The terms in full: [measurement and engagement terms](MEASUREMENT_AND_TERMS.md).
 
 ## What is and is not demonstrated today
 
-The free repository analyzer has been tested in the owner's environment. The external GitHub App G3 adversarial proof is **not verified**; a runbook is not its execution. No published example is evidence of a real customer's financial recovery, and no example receipt creates a payment claim.
+The free repository analyzer has been tested in the owner's environment. The external GitHub App G3 adversarial proof is **not verified**; a runbook is not its execution. No published example is evidence of a real customer's result.
 
 **The payment contract does not influence the verdict.** A contract, a read-only source integration, actual external use and any subsequent payment must each be evidenced separately.
 

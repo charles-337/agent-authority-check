@@ -122,6 +122,6 @@ The guard isn't published. Haven sets it up for one agent workflow against a cop
 
 **The Agent Authority Diagnostic.** If you would rather have this mapped and proven for one repository, rather than run the free check yourself, that is Haven's opt-in diagnostic: a written report for one repository and branch that shows exactly what your coding agent's credential can do to the branch, whether it could switch the rules off, who can bypass them, and the fix — every finding backed by a request you can repeat yourself, and the fix re-checked under the agent's own read-only token to confirm the finding no longer appears and that the token cannot switch the protection off. **$1,500, five business days after access and scope are agreed, invoiced on delivery.** It is opt-in: nothing is collected or charged unless you ask for it.
 
-- The two paid engagements in full — the $1,500 Agent Authority Diagnostic and the separate $1,000 economic-outcome pilot: [`commercial/START_HERE.md`](commercial/START_HERE.md).
+- The diagnostic in full, with its terms: [`commercial/START_HERE.md`](commercial/START_HERE.md).
 - Ask about a diagnostic: [open a sanitized request](../../issues/new?template=authority-diagnostic.yml) (no secrets, no private details), or email charles_337@me.com.
 - Questions, problems, ideas, or the guard: open an [issue](https://github.com/charles-337/agent-authority-check/issues), or email charles_337@me.com.
