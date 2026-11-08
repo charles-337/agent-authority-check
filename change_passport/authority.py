@@ -10,6 +10,7 @@ It only reads: every request is a GET, nothing is changed, and no token is writt
 request it came from and a command to check it yourself. Seeing a setting is not the power to change it, and a setting is not proof that
 GitHub refuses anything in practice: what this check cannot determine, it says. Python standard library only."""
 import argparse
+from dataclasses import replace
 import base64
 import hashlib
 import html
@@ -27,6 +28,8 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+from . import evidence_frame as EF
 
 API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "OK": 3}
@@ -108,19 +111,34 @@ class Reader:
         self.t, self.log = t, []
 
     def get(self, path, essential=False):
-        status, body, hdr = self.t.get(path)
+        try:
+            status, body, hdr = self.t.get(path)
+        except CheckError:
+            if essential:
+                raise
+            status, body, hdr = None, b"", {}          # no answer at all: framed as SOURCE_UNAVAILABLE, never as an empty result
         rid = f"R{len(self.log) + 1}"
         self.log.append({"id": rid, "method": "GET", "endpoint": path, "status": status, "sha256": hashlib.sha256(body or b"").hexdigest(),
                          "at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
         if status == 401 and essential:
             raise CheckError("GitHub rejected the credential (HTTP 401): check that the token is valid and not expired")
-        if status in (403, 429) and hdr.get("x-ratelimit-remaining") == "0":
+        if status in (403, 429) and hdr.get("x-ratelimit-remaining") == "0" and essential:
             raise CheckError("GitHub's rate limit is used up (unauthenticated: 60 requests an hour); set GITHUB_TOKEN or log in with gh, or try later")
         try:
             data = json.loads(body) if body else None
         except ValueError:
             data = None
         return rid, status, data, hdr
+
+    def observe(self, path, scope, **kw):
+        """One read as an evidence_frame Observation: whether GitHub answered stays apart from what it returned."""
+        rid, status, data, hdr = self.get(path)
+        return EF.observe_http(path, status, data, hdr, scope, at=self.log[-1]["at"], evidence=(rid,), **kw)
+
+
+def _unread(path, status, data, hdr):
+    o = EF.observe_http(path, status, data, hdr, "")
+    return f"{o.reason}, {o.detail}"
 
 
 def collect(t, repo, branch=None):
@@ -134,28 +152,66 @@ def collect(t, repo, branch=None):
     rid_repo, s, r, hdr = R.get(f"/repos/{repo}", essential=True)
     if s == 404:
         raise CheckError(f"{repo} was not found, or {t.name} cannot see it (HTTP 404)" + ("" if t.authenticated else "; for a private repository set GITHUB_TOKEN or log in with gh"))
-    if s != 200:
-        raise CheckError(f"could not read {repo} (HTTP {s})")
+    if s != 200 or not isinstance(r, dict):
+        raise CheckError(f"could not read {repo} ({_unread(f'/repos/{repo}', s, r, hdr)})")
     branch = branch or r.get("default_branch")
     b = urllib.parse.quote(branch, safe="")
-    rid_branch, s, br, _ = R.get(f"/repos/{repo}/branches/{b}")
+    path = f"/repos/{repo}/branches/{b}"
+    rid_branch, s, br, bh = R.get(path, essential=True)
     if s == 404:
         raise CheckError(f"branch {branch!r} was not found in {repo}")
-    rid_prot, s_prot, prot, _ = R.get(f"/repos/{repo}/branches/{b}/protection")
-    rid_rules, s_rules, rules, _ = R.get(f"/repos/{repo}/rules/branches/{b}")
+    if s != 200 or not isinstance(br, dict):                 # nothing below may stand on a branch that was not read
+        raise CheckError(f"could not read branch {branch!r} in {repo} ({_unread(path, s, br, bh)}); no report is built without it")
+    obs = {"branch": EF.observed(path, br, f"GitHub's data for branch {branch}", at=R.log[-1]["at"], evidence=(rid_branch,)),
+           "protection": R.observe(f"{path}/protection", f"classic branch-protection settings of {branch}", expect=dict, on_404=EF.PERMISSION_DENIED),
+           "rules": R.observe(f"/repos/{repo}/rules/branches/{b}", f"active ruleset rules for {branch}", expect=list), "codeowners": []}
     co = {"text": None, "path": None, "rids": []}
-    for path in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
-        rid, s, c, _ = R.get(f"/repos/{repo}/contents/{path}?ref={b}")
-        co["rids"].append(rid)
-        if s == 200 and isinstance(c, dict) and c.get("content"):
-            co = {"text": base64.b64decode(c["content"]).decode("utf-8", "replace"), "path": path, "rids": [rid]}
+    for p in (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"):
+        o = R.observe(f"/repos/{repo}/contents/{p}?ref={b}", f"{p} on {branch}", expect=dict, absent=True)
+        obs["codeowners"].append(o)
+        co["rids"].append(o.evidence[0])
+        if o.status == EF.COMPLETE and o.value is not EF.ABSENT:
+            co = {"text": base64.b64decode(o.value.get("content") or "").decode("utf-8", "replace"), "path": p, "rids": [o.evidence[0]]}
             break
     return {"repo": repo, "branch": branch, "default_branch": r.get("default_branch"), "login": login, "via": t.name, "authenticated": t.authenticated,
             "scopes": hdr.get("x-oauth-scopes"), "repo_rid": rid_repo, "permissions": r.get("permissions"), "private": r.get("private"),
-            "protected": (br or {}).get("protected"), "classic_enabled": ((br or {}).get("protection") or {}).get("enabled"), "branch_rid": rid_branch,
-            "protection": prot if s_prot == 200 else None, "protection_status": s_prot, "protection_rid": rid_prot,
-            "rules": rules if s_rules == 200 and isinstance(rules, list) else None, "rules_status": s_rules, "rules_rid": rid_rules,
-            "codeowners": co, "log": R.log}
+            "protected": br.get("protected"), "classic_enabled": (br.get("protection") or {}).get("enabled"), "branch_rid": rid_branch,
+            "protection_rid": obs["protection"].evidence[0], "rules_rid": obs["rules"].evidence[0], "obs": obs, "codeowners": co, "log": R.log}
+
+
+def _settings(d):
+    """Classic protection settings when the admin-only read succeeded; None when they were not read (see d['obs']['protection'])."""
+    return d["obs"]["protection"].value if d["obs"]["protection"].status == EF.COMPLETE else None
+
+
+def _classic_frame(d):
+    """Resolve classic protection consistently before deriving any broader claim."""
+    o, br = d["obs"], d["branch"]
+    on = f"Classic branch protection is enabled on `{br}`"
+    return EF.agree(on, [
+        EF.frame(on, o["protection"], lambda v: True, says_true=f"Classic protection settings for `{br}` were read.",
+                 show=lambda v: sorted(k for k, x in v.items() if isinstance(x, dict))),
+        EF.frame(on, o["branch"], lambda v: _bool((v.get("protection") or {}).get("enabled")),
+                 says_true=f"GitHub's branch data shows classic protection on for `{br}`.", says_false=f"GitHub's branch data shows classic protection off for `{br}`.",
+                 show=lambda v: {"protection.enabled": (v.get("protection") or {}).get("enabled")}),
+        EF.frame(on, o["branch"], lambda v: False if v.get("protected") is False else None,
+                 says_false=f"GitHub reports `{br}` as not protected, which it documents as not protected by branch protections or rulesets.",
+                 show=lambda v: {"protected": v.get("protected")})])
+
+
+def _classic_off(d):
+    return _classic_frame(d).state == EF.KNOWN_FALSE
+
+
+def _conflicted_claim(claim, conflict):
+    return replace(conflict, claim=claim, does_not_permit=f"Any answer to: {claim}")
+
+
+def _rules_seen(d):
+    """The ruleset rules GitHub returned. On a failed read this is empty because nothing was SEEN, not because none exist: every
+    conclusion from a rule's absence goes through d['obs']['rules'].status (gap() and _frames())."""
+    o = d["obs"]["rules"]
+    return o.value if o.status in (EF.COMPLETE, EF.PARTIAL) else ()
 
 
 # ------------------------------------------------------------------------------------------------ the findings: configuration facts only
@@ -233,7 +289,7 @@ def _co(d):
 
 def _protects(d):
     """What the check could see protecting the branch, in words."""
-    rules, prot = d["rules"] or [], d["protection"]
+    rules, prot = _rules_seen(d), _settings(d)
     words = []
     for r in rules:
         w = RULE_WORDS.get(r.get("type"), r.get("type"))
@@ -242,8 +298,13 @@ def _protects(d):
             w += f" ({_approvals(prm.get('required_approving_review_count', 0))}" + (_co(d) if prm.get("require_code_owner_review") else "") + ")"
         if w not in words:
             words.append(w)
-    if d["classic_enabled"] is False:
+    classic_frame = _classic_frame(d)
+    if classic_frame.reason == EF.CONFLICTING_OBSERVATIONS:
+        classic = "unknown (CONFLICTING_OBSERVATIONS: the branch data and protection settings disagree)"
+    elif d["classic_enabled"] is False:
         classic = "off (public branch data: protection.enabled = false)"
+    elif d["protected"] is False:
+        classic = "off (public branch data: protected = false)"
     elif prot:
         rv = prot.get("required_pull_request_reviews")
         classic = "on: " + (f"pull request with {_approvals(rv.get('required_approving_review_count', 0))}" + (_co(d) if rv.get("require_code_owner_reviews") else "")
@@ -252,26 +313,68 @@ def _protects(d):
         classic = "on (its settings are visible only to repository admins)"
     else:
         classic = "unknown"
-    return [f"Classic branch protection: {classic}", "Rulesets: " + ("; ".join(words) if words else "none apply")]
+    o = d["obs"]["rules"]
+    if o.status == EF.COMPLETE:
+        listed = "; ".join(words) if words else "none apply"
+    elif o.status == EF.PARTIAL:
+        listed = ("; ".join(words) + "; " if words else "") + f"more not read ({o.reason}: {o.detail})"
+    else:
+        listed = f"unknown ({o.reason}: GitHub answered {o.detail})"     # a failed read is never "none apply"
+    return [f"Classic branch protection: {classic}", "Rulesets: " + listed]
 
 
-def findings(d):
-    F, repo, br = [], d["repo"], d["branch"]
+def _usable(d):
+    """Whether the token visibly carries a scope that lets an admin role act (classic tokens only; others do not show their power)."""
+    scopes = [s.strip() for s in (d["scopes"] or "").split(",") if s.strip()]
+    return "repo" in scopes or ("public_repo" in scopes and d["private"] is False)
+
+
+def assess(d):
+    """Configuration facts as findings. A finding that concludes from something's absence (no rule, no review, no file) is added only when
+    every read it needs completed; otherwise it is held as an unresolved claim with the reason (evidence_frame), never reported as fact."""
+    F, held, repo, br = [], [], d["repo"], d["branch"]
     qb = urllib.parse.quote(br, safe="")
-    prot, rules = d["protection"], d["rules"] or []
+    prot, rules = _settings(d), _rules_seen(d)
     branch_rules = [x for x in rules if not str(x.get("type") or "").startswith("repository_")]  # repository_* rules govern the repo (visibility, rename, deletion), not pushes to this branch
     pr = [x.get("parameters") or {} for x in rules if x.get("type") == "pull_request"]
     rv = (prot or {}).get("required_pull_request_reviews")
 
+    classic_frame = _classic_frame(d)
+
     def add(sev, key, title, detail, evidence, verify, fix, expect="", ruleset=None):
+        if (classic_frame.reason == EF.CONFLICTING_OBSERVATIONS and sev in ("HIGH", "MEDIUM")
+                and key not in ("credential-can-change-protection", "account-is-admin")):
+            held.append({"id": key, "severity_if_confirmed": sev, "question": f"whether this claim holds: {title}",
+                         "frame": _conflicted_claim(title, classic_frame)})
+            return
         name, rs = ruleset or (None, None)
         F.append({"severity": sev, "id": key, "title": title, "detail": detail, "evidence": evidence, "verify": verify, "expect": expect, "fix": fix,
                   "apply": _ruleset(d, name, rs) if rs else None, "apply_solo": _ruleset(d, name, rs, ADMIN_MERGES) if rs else None,
                   "apply_note": _private(d) if rs else ""})
 
+    def unsettled(needs):
+        """The first read this conclusion needs that did not complete, or None. Classic settings are settled when the branch data shows
+        classic protection off, or when the admin-only read succeeded; CODEOWNERS when all three places answered."""
+        for n in needs:
+            if n == "classic" and not _classic_off(d) and _settings(d) is None:
+                return d["obs"]["protection"]
+            if n == "rules" and d["obs"]["rules"].status != EF.COMPLETE:
+                return d["obs"]["rules"]
+            if n == "codeowners" and d["codeowners"]["text"] is None:
+                return next((r for r in d["obs"]["codeowners"] if r.status != EF.COMPLETE), None)
+        return None
+
+    def gap(needs, question, sev, key, title, *rest, **kw):
+        """An absence-based finding: added when its reads completed, otherwise held, unresolved, with the severity it would have."""
+        blocker = unsettled(needs)
+        if blocker is None:
+            return add(sev, key, title, *rest, **kw)
+        held.append({"id": key, "severity_if_confirmed": sev, "question": question, "frame": EF.frame(title, blocker, lambda v: False)})
+
     # 1. Is there anything between an agent's commit and the branch?
     if d["protected"] is False and not branch_rules:
-        add("HIGH", "branch-unprotected", f"Nothing stops a direct push to `{br}`.",
+        gap(("rules",), f"whether anything stops a direct push to `{br}`",
+            "HIGH", "branch-unprotected", f"Nothing stops a direct push to `{br}`.",
             f"`{br}` has no branch protection and " + ("only a repository-level ruleset — it governs repository settings such as visibility, renaming or "
             "deletion, not pushes to this branch" if rules else "no ruleset") + ". Any credential with write access, including a token you give a coding "
             "agent, can push straight to it: no pull request, review or check is required." + (f" The repository has a {d['codeowners']['path']} file, but "
@@ -283,7 +386,8 @@ def findings(d):
             '"protected": false and "enabled": false, then no rule whose type governs pushes to this branch',
             (f"Protect {br}", [{"type": "deletion"}, {"type": "non_fast_forward"}, PR_RULE]))
     if d["protected"] and d["classic_enabled"] is False and branch_rules and not BLOCKING & {x.get("type") for x in branch_rules}:
-        add("HIGH", "no-pull-request-required", f"Nothing requires a pull request before commits land on `{br}`.",
+        gap(("rules",), f"whether anything requires a pull request before commits land on `{br}`",
+            "HIGH", "no-pull-request-required", f"Nothing requires a pull request before commits land on `{br}`.",
             f"The only rules on `{br}` are: {'; '.join(_protects(d)[1][len('Rulesets: '):].split('; '))}. Classic branch protection is off, so any credential with write "
             "access, including a token you give a coding agent, can push commits straight to it.",
             [f"{d['branch_rid']}: protected = true, protection.enabled = false", f"{d['rules_rid']}: rule types = {', '.join(sorted({x.get('type') for x in branch_rules}))}"],
@@ -294,7 +398,8 @@ def findings(d):
     types = {x.get("type") for x in branch_rules}
     if d["protected"] and d["classic_enabled"] is False and branch_rules and "pull_request" not in types and (CHECK_GATE | PUSH_GATE) & types:
         gates = ", ".join(RULE_WORDS.get(t, t) for t in sorted((CHECK_GATE | PUSH_GATE) & types))
-        add("MEDIUM", "no-review-required", f"Changes to `{br}` require no human review.",
+        gap(("rules",), f"whether changes to `{br}` require a human review",
+            "MEDIUM", "no-review-required", f"Changes to `{br}` require no human review.",
             f"`{br}` has rules that {gates}, but none that requires a pull request or an approving review. Classic branch protection is off, so any "
             f"identity that satisfies those rules, including a token you give a coding agent, can land commits on `{br}` with no human review.",
             [f"{d['branch_rid']}: protected = true, protection.enabled = false",
@@ -307,13 +412,15 @@ def findings(d):
     reviews = [rv.get("required_approving_review_count", 0)] if rv else []
     reviews += [x.get("required_approving_review_count", 0) for x in pr]
     if (rv or pr) and max(reviews) == 0 and not ((rv or {}).get("require_code_owner_reviews") or any(x.get("require_code_owner_review") for x in pr)):
-        add("MEDIUM", "no-approval-required", f"Pull requests into `{br}` need no approval.",
+        gap(("rules", "classic"), f"whether pull requests into `{br}` need an approval",             # an unread rule set may require one
+            "MEDIUM", "no-approval-required", f"Pull requests into `{br}` need no approval.",
             "A pull request is required, but with zero approvals and no code-owner review its author, human or agent, can merge it alone.",
             [f"{d['protection_rid'] if rv else d['rules_rid']}: required approvals = 0, code-owner review off"],
             _curl(d, f"/repos/{repo}/rules/branches/{qb}"), "Require at least one approval from someone other than the author.")
     if reviews and max(reviews) >= 1 and not ((rv or {}).get("dismiss_stale_reviews") or (rv or {}).get("require_last_push_approval")
                                               or any(x.get("dismiss_stale_reviews_on_push") or x.get("require_last_push_approval") for x in pr)):
-        add("MEDIUM", "approval-survives-new-commits", "An approval stays valid after new commits are pushed.",
+        gap(("rules", "classic"), f"whether an approval on `{br}` stays valid after new commits",
+            "MEDIUM", "approval-survives-new-commits", "An approval stays valid after new commits are pushed.",
             "Neither 'dismiss stale approvals' nor 'require approval of the most recent push' is on, so a change can be altered after a person approved it.",
             [f"{d['protection_rid'] if rv else d['rules_rid']}: stale-approval dismissal off, most-recent-push approval off"],
             _curl(d, f"/repos/{repo}/rules/branches/{qb}"), "Turn on 'Require approval of the most recent reviewable push'.")
@@ -330,7 +437,8 @@ def findings(d):
             "Remove the bypass actors, or make sure no identity a coding agent can use is among them.")
     if d["classic_enabled"] and prot is not None and not rv and not pr:
         reqd = "status checks" if (prot.get("required_status_checks") or {}) else "some non-review controls"
-        add("MEDIUM", "no-review-required-classic", f"Classic protection on `{br}` requires no human review.",
+        gap(("rules",), f"whether `{br}` requires a human review",                                     # an unread ruleset may require it
+            "MEDIUM", "no-review-required-classic", f"Classic protection on `{br}` requires no human review.",
             f"`{br}` has classic branch protection, but it does not require a pull-request review (it requires {reqd}). "
             f"Any identity that satisfies those controls, including a token you give a coding agent, can land commits on "
             f"`{br}` with no human approval.",
@@ -341,11 +449,13 @@ def findings(d):
     # A ruleset `non_fast_forward` overrides classic allow_force_pushes (GitHub applies both; the stricter wins), so
     # the classic finding must not fire when the ruleset already blocks force-pushes.
     if prot and (prot.get("allow_force_pushes") or {}).get("enabled") and "non_fast_forward" not in rule_types:
-        add("MEDIUM", "force-push-allowed", f"Force-pushes to `{br}` are allowed.", "Its history can be rewritten.",
+        gap(("rules",), f"whether force-pushes to `{br}` are blocked",                                 # an unread ruleset may block them
+            "MEDIUM", "force-push-allowed", f"Force-pushes to `{br}` are allowed.", "Its history can be rewritten.",
             [f"{d['protection_rid']}: allow_force_pushes.enabled = true"], _curl(d, f"/repos/{repo}/branches/{qb}/protection", '"allow_force_pushes"', auth=True), "Block force-pushes.")
     # On the ruleset path, `non_fast_forward` blocks force-pushes and `update` restricts who may push (both gate it).
     if d["classic_enabled"] is False and branch_rules and not ({"non_fast_forward", "update"} & rule_types):
-        add("MEDIUM", "force-push-allowed-ruleset", f"Force-pushes to `{br}` are allowed.",
+        gap(("rules",), f"whether force-pushes to `{br}` are blocked",
+            "MEDIUM", "force-push-allowed-ruleset", f"Force-pushes to `{br}` are allowed.",
             "A ruleset protects this branch, but nothing blocks force-pushes (no `non_fast_forward`) and nothing restricts who may push, so its history can be rewritten.",
             [f"{d['rules_rid']}: rule types = {', '.join(sorted(t for t in rule_types if t))}; no non_fast_forward or update; classic protection off"],
             _curl(d, f"/repos/{repo}/rules/branches/{qb}", '"type"'),
@@ -359,8 +469,7 @@ def findings(d):
     who = f"`{d['login']}`" if d["login"] else "This credential"
     if perms.get("admin"):
         scope_list = [s.strip() for s in (scopes or "").split(",") if s.strip()]
-        usable = "repo" in scope_list or ("public_repo" in scope_list and d["private"] is False)
-        if usable:
+        if _usable(d):
             add("HIGH", "credential-can-change-protection", f"This credential can change or remove the protection on `{br}`.",
                 f"{who} is an admin of {repo}, and the token carries the `{'repo' if 'repo' in scope_list else 'public_repo'}` scope, which lets it use those admin rights: "
                 "it can edit or delete branch protection and rulesets. If an agent uses this credential, no branch rule holds against it.",
@@ -381,7 +490,8 @@ def findings(d):
     co = d["codeowners"]
     if co["text"] is None:
         asks = (rv or {}).get("require_code_owner_reviews") or any(x.get("require_code_owner_review") for x in pr)
-        add("LOW", "no-codeowners", "No code owner is assigned to the workflows or review rules.",
+        gap(("codeowners",), "whether a CODEOWNERS file exists",
+            "LOW", "no-codeowners", "No code owner is assigned to the workflows or review rules.",
             "There is no CODEOWNERS file, so " + (f"the rule on `{br}` that asks for code-owner review requires nothing, and " if asks else "")
             + "changes to .github/ (including the workflows that run your checks) cannot require an owner's review. "
             "GitHub's guidance is to name an owner for the CODEOWNERS file itself.", [f"{', '.join(co['rids'])}: no CODEOWNERS file found"],
@@ -396,23 +506,126 @@ def findings(d):
                 "Add lines for /.github/ and for the CODEOWNERS file, owned by a person.")
     F.sort(key=lambda f: ORDER[f["severity"]])
     unknown = []
+    o = d["obs"]["rules"]
+    if o.status != EF.COMPLETE:
+        unknown.append(f"Which rulesets apply to `{br}` ({o.reason}: GitHub answered {o.detail}): ruleset rules are shown only as far as they were read, "
+                       "and nothing here is concluded from a rule's absence. " + (EF.RESOLVE[EF.PLAN_LIMITED] if o.reason == EF.PLAN_LIMITED else "Run the check again to read them."))
+    co_open = next((r for r in d["obs"]["codeowners"] if r.status != EF.COMPLETE), None) if d["codeowners"]["text"] is None else None
+    if co_open:
+        unknown.append(f"Whether a CODEOWNERS file exists ({co_open.reason}: GitHub answered {co_open.detail} for {co_open.source}).")
     if d["protected"] and prot is None and d["classic_enabled"] is not False:
-        unknown.append(f"`{br}`'s classic branch-protection settings (HTTP {d['protection_status']}): only repository admins can read them.")
+        unknown.append(f"`{br}`'s classic branch-protection settings ({d['obs']['protection'].detail}): only repository admins can read them.")
     if not d["authenticated"]:
         unknown.append("What any particular credential may do: run with GITHUB_TOKEN set to your agent's token (read access is enough) to see that.")
     elif not d["permissions"]:
         unknown.append("This credential's role: GitHub did not report one (workflow and app tokens get their permissions from the workflow or app settings).")
     unknown.append("Whether GitHub refuses a change in practice: this check reads settings and never tries one. A ruleset's bypass list — which actors may skip its "
                    "pull-request rule — is not returned by GitHub's rules API, so ruleset bypass actors are not visible here (classic bypass allowances, when readable, are reported above).")
+    return F, unknown, held
+
+
+def findings(d):
+    """(findings, cannot_determine), as before; assess() also returns the claims held back as unresolved."""
+    F, unknown, _ = assess(d)
     return F, unknown
 
 
+def _bool(x):
+    return x if isinstance(x, bool) else None
+
+
+def _frames(d):
+    """The claims the verdict rests on, each framed against what was actually read (evidence_frame): known, or unknown and why."""
+    o, br, repo = d["obs"], d["branch"], d["repo"]
+    flag = EF.frame(f"GitHub reports `{br}` as protected", o["branch"], lambda v: _bool(v.get("protected")),
+                    says_true=f"GitHub's branch data reports `{br}` as protected.", says_false=f"GitHub's branch data reports `{br}` as not protected.",
+                    beyond="Which rules, bypasses or other controls apply: the flag is GitHub's summary of the branch, not a list of them.",
+                    show=lambda v: {"protected": v.get("protected")})
+    classic = _classic_frame(d)
+    governs = f"A ruleset rule governs pushes to `{br}`"
+    rules = EF.frame(governs, o["rules"], lambda v: any(not str(x.get("type") or "").startswith("repository_") for x in v),
+                     says_true=f"At least one ruleset rule applies to pushes to `{br}`.",
+                     says_false=f"No ruleset rule applies to pushes to `{br}`: GitHub's rules endpoint answered, and every rule it returned was read.",
+                     beyond="Who may bypass a ruleset: GitHub's rules endpoint does not return bypass lists.", show=lambda v: sorted({x.get("type") for x in v}))
+    prq = f"A pull request is required before changes land on `{br}`"
+    classic_off = _classic_off(d)
+    classic_pr = (EF.frame(prq, o["branch"], lambda v: False,
+                           says_false=f"Classic protection is off on `{br}`, so it requires nothing.")
+                  if classic_off else
+                  EF.frame(prq, o["protection"], lambda v: bool(v.get("required_pull_request_reviews")),
+                           says_true=f"Classic protection on `{br}` requires a pull request.",
+                           says_false=f"Classic protection on `{br}` does not require a pull request."))
+    if classic.reason == EF.CONFLICTING_OBSERVATIONS:
+        classic_pr = _conflicted_claim(prq, classic)
+    pr = EF.derive(prq, {
+        "rulesets": EF.frame(prq, o["rules"], lambda v: any(x.get("type") == "pull_request" for x in v),
+                             says_true=f"A ruleset requires a pull request on `{br}`.", says_false=f"No ruleset requires a pull request on `{br}`."),
+        "classic protection": classic_pr}, needs=("rulesets", "classic protection"))
+    cq = "A CODEOWNERS file exists"
+    reads, co = o["codeowners"], d["codeowners"]
+    if co["text"] is not None:
+        codeowners = EF.frame(cq, next(r for r in reads if co["rids"][0] in r.evidence), lambda v: True, says_true=f"{co['path']} exists.",
+                              show=lambda v: co["path"])
+    elif all(r.status == EF.COMPLETE for r in reads):
+        codeowners = EF.frame(cq, EF.observed(" + ".join(r.source for r in reads), EF.ABSENT, "the three places GitHub looks for CODEOWNERS",
+                                              at=reads[0].observed_at, evidence=tuple(e for r in reads for e in r.evidence)),
+                              lambda v: False, says_false="No CODEOWNERS file exists in any of the three places GitHub looks.", show=lambda v: "ABSENT")
+    else:
+        codeowners = EF.frame(cq, next(r for r in reads if r.status != EF.COMPLETE), lambda v: None)
+    can = f"This credential can change or remove `{br}`'s protection"
+    beyond = "Whether GitHub refuses a change in practice: this check reads settings and never tries one."
+    if not d["authenticated"]:
+        cred = EF.frame(can, EF.not_attempted(f"/repos/{repo}", "this credential's role", detail="no credential was used"), lambda v: None,
+                        beyond=beyond, resolve="Run again with GITHUB_TOKEN set to your agent's token (read access is enough).")
+    elif not d["permissions"]:
+        cred = EF.frame(can, EF.failed(f"/repos/{repo}", EF.NOT_OBSERVED, "this credential's role", detail="GitHub reported no role for this credential",
+                                       evidence=(d["repo_rid"],)), lambda v: None, beyond=beyond,
+                        resolve="Read the permissions in the workflow or app settings that issued the token.")
+    else:
+        cred = EF.frame(can, EF.observed(f"/repos/{repo}", {"permissions": d["permissions"], "scopes": d["scopes"]},
+                                         "the role and token scopes GitHub reported for this credential", evidence=(d["repo_rid"],)),
+                        lambda v: (True if _usable(d) else None) if v["permissions"].get("admin") else False,
+                        says_true="The credential is a repository admin and its token carries a scope that uses those rights.",
+                        says_false="The credential has no admin role on the repository.", beyond=beyond, show=lambda v: v,
+                        resolve="Check the token's own settings: one created with 'Administration: write' can change protection.")
+    bq = f"Someone can bypass the review required on `{br}`"
+    bypass_classic = (EF.frame(bq, o["branch"], lambda v: False, says_false="Classic protection is off, so there is no classic bypass list.")
+                      if classic_off else
+                      EF.frame(bq, o["protection"], lambda v: bool(((v.get("required_pull_request_reviews") or {}).get("bypass_pull_request_allowances") or {})
+                                                                    and any(((v["required_pull_request_reviews"]["bypass_pull_request_allowances"]).get(k))
+                                                                            for k in ("users", "teams", "apps"))),
+                               says_true=f"Classic protection on `{br}` lists actors who may bypass its required review.",
+                               says_false=f"Classic protection on `{br}` lists no one who may bypass its review."))
+    if classic.reason == EF.CONFLICTING_OBSERVATIONS:
+        bypass_classic = _conflicted_claim(bq, classic)
+    r = o["rules"]
+    if r.status == EF.COMPLETE and not any(x.get("type") == "pull_request" for x in r.value):
+        bypass_rules = EF.frame(bq, r, lambda v: False, says_false="No ruleset requires a review, so no ruleset review can be bypassed.")
+    elif r.status in (EF.COMPLETE, EF.PARTIAL):
+        bypass_rules = EF.frame(bq, EF.observed(r.source, r.value, "ruleset bypass lists", partial=True, at=r.observed_at, evidence=r.evidence,
+                                                detail="GitHub's rules endpoint does not return who may bypass a ruleset"), lambda v: False,
+                                resolve="Read the ruleset's bypass list in Settings › Rules, as a repository admin.")
+    else:
+        bypass_rules = EF.frame(bq, r, lambda v: None)
+    bypass = EF.derive(bq, {"classic bypass list": bypass_classic, "ruleset bypass lists": bypass_rules},
+                       needs=("classic bypass list", "ruleset bypass lists"))
+    return [("branch-protected-flag", flag), ("classic-protection", classic), ("rulesets", rules), ("pull-request-required", pr),
+            ("codeowners", codeowners), ("credential-can-change-protection", cred), ("review-bypass", bypass)]
+
+
 def build(d):
-    F, unknown = findings(d)
+    F, unknown, held = assess(d)
+    core = _frames(d)
+    frames = ([{"id": k, **f.to_dict(), "severity_if_confirmed": None} for k, f in core]
+              + [{"id": h["id"], **h["frame"].to_dict(), "severity_if_confirmed": h["severity_if_confirmed"]} for h in held])
+    pr = dict(core)["pull-request-required"]
     risky = [f for f in F if f["severity"] in ("HIGH", "MEDIUM")]
     if risky:
         verdict = risky[0]["title"]
-    elif d["protected"] and d["protection"] is None and d["classic_enabled"] is not False:
+    elif held or pr.state == EF.UNKNOWN:                  # unknown is never "no gap found"
+        q, fr = (held[0]["question"], held[0]["frame"]) if held else (f"whether a pull request is required before changes land on `{d['branch']}`", pr)
+        verdict = f"{q[0].upper()}{q[1:]} cannot be determined here ({fr.reason}: {fr.limitation}). See what is known and what is not, below."
+    elif d["protected"] and _settings(d) is None and d["classic_enabled"] is not False:
         verdict = (f"`{d['branch']}` is protected, but its settings are visible only to repository admins. No gap found in what is visible"
                    + ("." if d["authenticated"] else "; run with your agent's token to see what that credential may do."))
     else:
@@ -426,6 +639,7 @@ def build(d):
                                                    else "none (the public view)"),
             "verdict": verdict, "protects": _protects(d), "findings": F, "recheck": recheck, "cannot_determine": unknown,
             "counts": {s: sum(1 for f in F if f["severity"] == s) for s in ORDER},
+            "frames": frames, "unresolved": sum(1 for f in frames if f["state"] == EF.UNKNOWN),
             "limits": "Read-only: only GET requests, nothing changed. Findings are configuration facts read from GitHub; they show what is configured and what a "
                       "credential is permitted to do, not what GitHub will refuse in practice.", "evidence": d["log"]}
 
@@ -469,6 +683,20 @@ def _beyond(rep):
     return first + BEYOND, last
 
 
+def epistemic(rep):
+    """The 'what is known and what is not' section, from rep['frames'] alone, so every output says the same thing: (heading, lines)."""
+    fr = rep.get("frames") or []
+    known = [f for f in fr if f["state"] != "UNKNOWN"]
+    open_ = [f for f in fr if f["state"] == "UNKNOWN"]
+    sev = lambda f: f" (would be {f['severity_if_confirmed']} if confirmed)" if f.get("severity_if_confirmed") else ""
+    return [("Known", [f"{f['permits']} [{f['state']}]" for f in known] or ["Nothing settled."]),
+            ("Unknown", [f"{f['claim']}{sev(f)}" for f in open_] or ["Nothing within this check's scope."]),
+            ("Why unknown", [f"{f['claim']}: {f['reason']} — {f['limitation']} ({f['source']})" for f in open_]),
+            ("Safe conclusion", list(dict.fromkeys(f["permits"] for f in open_))),
+            ("Claims this evidence does not support", list(dict.fromkeys(f["does_not_permit"] for f in fr if f["does_not_permit"]))),
+            ("How to resolve the uncertainty", list(dict.fromkeys(f["resolve"] for f in open_ if f["resolve"])))]
+
+
 def markdown(rep):
     L = [f"# Agent Authority Check: {rep['repository']} @ `{rep['branch']}`", "", f"**{rep['verdict']}**", "",
          f"Credential: {rep['credential']} · {rep['generated_at']}", "", f"**What protects `{rep['branch']}`** (as visible to this credential)", ""]
@@ -483,8 +711,11 @@ def markdown(rep):
     if rep.get("recheck"):
         L += ["### After a fix", ""] + [f"- {x}" for x in rep["recheck"]] + [""]
     L += ["### Cannot be determined from here", ""] + [f"- {x}" for x in rep["cannot_determine"]] + [""]
+    L += ["### What is known and what is not", ""]
+    for head, lines in epistemic(rep):
+        L += [f"**{head}**", ""] + ([f"- {x}" for x in lines] or ["- Nothing."]) + [""]
     L += ["### How this was checked", "", rep["limits"], "", "| | Request | HTTP |", "|---|---|---|"]
-    L += [f"| {r['id']} | `GET {r['endpoint']}` | {r['status']} |" for r in rep["evidence"]]
+    L += [f"| {r['id']} | `GET {r['endpoint']}` | {r['status'] or 'no response'} |" for r in rep["evidence"]]
     lead, last = _beyond(rep)
     L += ["", "### Beyond branch settings", "", lead, "", last]
     return "\n".join(L + ["", f"_{FOOTER}_", ""])
@@ -516,8 +747,10 @@ def page(rep):
     if rep.get("recheck"):
         out.append("<h2>After a fix</h2><ul>" + "".join(f"<li>{md(x)}</li>" for x in rep["recheck"]) + "</ul>")
     out.append("<h2>Cannot be determined from here</h2><ul>" + "".join(f"<li>{md(x)}</li>" for x in rep["cannot_determine"]) + "</ul>")
+    out.append("<h2>What is known and what is not</h2>" + "".join(
+        f"<h3>{e(head)}</h3><ul>" + ("".join(f"<li>{md(x)}</li>" for x in lines) or "<li>Nothing.</li>") + "</ul>" for head, lines in epistemic(rep)))
     out.append(f"<h2>How this was checked</h2><p>{e(rep['limits'])}</p><div class='wrap'><table><tr><th></th><th>Request</th><th>HTTP</th></tr>")
-    out += [f"<tr><td>{r['id']}</td><td><code>GET {e(r['endpoint'])}</code></td><td>{r['status']}</td></tr>" for r in rep["evidence"]]
+    out += [f"<tr><td>{r['id']}</td><td><code>GET {e(r['endpoint'])}</code></td><td>{r['status'] or 'no response'}</td></tr>" for r in rep["evidence"]]
     lead, last = _beyond(rep)
     link = f"<a href='{e(GUARD_URL)}'>{e(GUARD_URL)}</a>"
     out.append(f"</table></div><h2>Beyond branch settings</h2><p>{md(lead)}</p><p>{md(last).replace(e(GUARD_URL), link)}</p>")
@@ -560,7 +793,8 @@ def main(argv=None, t=None):
     ap.add_argument("--anonymize", action="store_true", help="replace repository, owner and user names with placeholders before sharing")
     ap.add_argument("--emit-passport", dest="emit_passport", metavar="PATH", help="also write a Change Passport policy starter tailored to this repository (feeds change-passport init)")
     ap.add_argument("--summary", action="store_true", help="inside GitHub Actions: add the report to the run summary")
-    ap.add_argument("--fail-on-high", action="store_true", help="exit 1 when a HIGH finding exists (for CI)")
+    ap.add_argument("--fail-on-high", action="store_true", help="exit 1 when a HIGH finding exists, and 3 when none is confirmed but a claim that "
+                    "would be HIGH could not be settled (for CI: unknown is neither a pass nor a HIGH)")
     a = ap.parse_args(argv)
     try:
         d = collect(t or transport(a.anonymous), a.repo, a.branch)
@@ -582,8 +816,13 @@ def main(argv=None, t=None):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
             f.write(markdown(rep) + "\n")
     print(f"{rep['verdict']}\n{rep['counts']['HIGH']} high, {rep['counts']['MEDIUM']} medium, {rep['counts']['LOW']} low, "
+          f"{rep['unresolved']} unresolved, "
           f"{len(rep['cannot_determine'])} thing{'' if len(rep['cannot_determine']) == 1 else 's'} this credential could not see · open {out / 'report.html'}")
-    return 1 if a.fail_on_high and rep["counts"]["HIGH"] else 0
+    if a.fail_on_high and rep["counts"]["HIGH"]:
+        return 1
+    if a.fail_on_high and any(f["state"] == "UNKNOWN" and f.get("severity_if_confirmed") == "HIGH" for f in rep["frames"]):
+        return 3
+    return 0
 
 
 if __name__ == "__main__":
